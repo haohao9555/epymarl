@@ -1,0 +1,17 @@
+{"time":"2026-06-09T20:10:05.0887369+08:00","level":"INFO","msg":"wandb-core"}
+{"time":"2026-06-09T20:10:05.0892419+08:00","level":"INFO","msg":"stream: starting","core version":"0.26.1"}
+{"time":"2026-06-09T20:10:07.1665427+08:00","level":"INFO","msg":"stream: created new stream","id":"fsjfi0yc"}
+{"time":"2026-06-09T20:10:07.1665427+08:00","level":"INFO","msg":"handler: started"}
+{"time":"2026-06-09T20:10:07.1756984+08:00","level":"INFO","msg":"stream: started"}
+{"time":"2026-06-09T20:10:07.1756984+08:00","level":"INFO","msg":"sender: started"}
+{"time":"2026-06-09T20:10:07.1756984+08:00","level":"INFO","msg":"writer: started","stream_id":"fsjfi0yc"}
+{"time":"2026-06-09T20:10:07.5020063+08:00","level":"ERROR","msg":"api: HTTP error","status":404,"method":"POST","url":"https://api.wandb.ai/graphql"}
+{"time":"2026-06-09T20:10:07.5025082+08:00","level":"ERROR","msg":"runupserter: failed to init run","error":"returned error 404: {\"data\":{\"upsertBucket\":null},\"errors\":[{\"message\":\"entity adolf9555 not found during upsertBucket\",\"path\":[\"upsertBucket\"]}]}"}
+{"time":"2026-06-09T20:10:07.5089496+08:00","level":"ERROR","msg":"sender: uploadConfigFile: runhandle: run not yet initialized"}
+{"time":"2026-06-09T20:10:07.5089496+08:00","level":"ERROR","msg":"runfiles: runhandle: run not yet initialized"}
+{"time":"2026-06-09T20:10:07.5098213+08:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2026-06-09T20:10:07.5103233+08:00","level":"INFO","msg":"stream: finishing up"}
+{"time":"2026-06-09T20:10:07.5103233+08:00","level":"INFO","msg":"handler: closed"}
+{"time":"2026-06-09T20:10:07.5103233+08:00","level":"INFO","msg":"sender: closed"}
+{"time":"2026-06-09T20:10:07.5103233+08:00","level":"INFO","msg":"stream: all finished"}
+{"time":"2026-06-09T20:10:07.5108321+08:00","level":"ERROR","msg":"stream: runURL: runhandle: run not yet initialized"}

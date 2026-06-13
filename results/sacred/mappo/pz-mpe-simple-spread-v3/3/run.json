@@ -1,0 +1,125 @@
+{
+  "artifacts": [],
+  "command": "my_main",
+  "experiment": {
+    "base_dir": "E:\\Vscode program\\epymarl-main\\src",
+    "dependencies": [
+      "numpy==2.0.2",
+      "sacred==0.8.7",
+      "torch==2.8.0"
+    ],
+    "mainfile": "main.py",
+    "name": "pymarl",
+    "repositories": [],
+    "sources": [
+      [
+        "main.py",
+        "_sources\\main_b2cc1db06d11795e4f8cf6a3b0165fa1.py"
+      ],
+      [
+        "run.py",
+        "_sources\\run_29fd448eb2929a57e5fd2547c431175b.py"
+      ],
+      [
+        "utils\\logging.py",
+        "_sources\\logging_80685d67fab61f6e71e93fbe28085531.py"
+      ]
+    ]
+  },
+  "fail_trace": [
+    "Traceback (most recent call last):\n",
+    "  File \"E:\\Vscode program\\epymarl-main\\MPE\\lib\\site-packages\\sacred\\config\\captured_function.py\", line 42, in captured_function\n    result = wrapped(*args, **kwargs)\n",
+    "  File \"E:\\Vscode program\\epymarl-main\\src\\main.py\", line 44, in my_main\n    run(_run, config, _log)\n",
+    "  File \"E:\\Vscode program\\epymarl-main\\src\\run.py\", line 59, in run\n    logger.setup_wandb(\n",
+    "  File \"E:\\Vscode program\\epymarl-main\\src\\utils\\logging.py\", line 62, in setup_wandb\n    self.wandb = wandb.init(\n",
+    "  File \"E:\\Vscode program\\epymarl-main\\MPE\\lib\\site-packages\\wandb\\sdk\\wandb_init.py\", line 1603, in init\n    get_sentry().reraise(e)\n",
+    "  File \"E:\\Vscode program\\epymarl-main\\MPE\\lib\\site-packages\\wandb\\analytics\\sentry.py\", line 190, in reraise\n    raise exc.with_traceback(tb)\n",
+    "  File \"E:\\Vscode program\\epymarl-main\\MPE\\lib\\site-packages\\wandb\\sdk\\wandb_init.py\", line 1524, in init\n    wi.maybe_login(init_settings)\n",
+    "  File \"E:\\Vscode program\\epymarl-main\\MPE\\lib\\site-packages\\wandb\\sdk\\wandb_init.py\", line 200, in maybe_login\n    wandb_login._login(\n",
+    "  File \"E:\\Vscode program\\epymarl-main\\MPE\\lib\\site-packages\\wandb\\sdk\\wandb_login.py\", line 190, in _login\n    auth = _find_or_prompt_for_key(\n",
+    "  File \"E:\\Vscode program\\epymarl-main\\MPE\\lib\\site-packages\\wandb\\sdk\\wandb_login.py\", line 266, in _find_or_prompt_for_key\n    auth = wbauth.authenticate_session(\n",
+    "  File \"E:\\Vscode program\\epymarl-main\\MPE\\lib\\site-packages\\wandb\\sdk\\lib\\wbauth\\authenticate.py\", line 127, in authenticate_session\n    if not relogin and (auth := _use_system_auth(host=host, source=source)):\n",
+    "  File \"E:\\Vscode program\\epymarl-main\\MPE\\lib\\site-packages\\wandb\\sdk\\lib\\wbauth\\authenticate.py\", line 194, in _use_system_auth\n    term.termlog(\n",
+    "  File \"E:\\Vscode program\\epymarl-main\\MPE\\lib\\site-packages\\wandb\\errors\\term.py\", line 217, in termlog\n    _log(\n",
+    "  File \"E:\\Vscode program\\epymarl-main\\MPE\\lib\\site-packages\\wandb\\errors\\term.py\", line 520, in _log\n    click.echo(string, file=sys.stderr, nl=newline)\n",
+    "  File \"E:\\Vscode program\\epymarl-main\\MPE\\lib\\site-packages\\click\\utils.py\", line 318, in echo\n    file.write(out)  # type: ignore\n",
+    "  File \"E:\\Vscode program\\epymarl-main\\MPE\\lib\\site-packages\\click\\_compat.py\", line 542, in _safe_write\n    return _write(s)\n",
+    "  File \"E:\\Vscode program\\epymarl-main\\MPE\\lib\\site-packages\\colorama\\ansitowin32.py\", line 47, in write\n    self.__convertor.write(text)\n",
+    "  File \"E:\\Vscode program\\epymarl-main\\MPE\\lib\\site-packages\\colorama\\ansitowin32.py\", line 179, in write\n    self.wrapped.write(text)\n",
+    "  File \"E:\\Vscode program\\epymarl-main\\MPE\\lib\\site-packages\\wandb\\sdk\\lib\\console_capture.py\", line 184, in write_with_callbacks\n    n = orig_write(s)\n",
+    "OSError: [WinError 6] \u53e5\u67c4\u65e0\u6548\u3002\n"
+  ],
+  "heartbeat": "2026-06-09T12:06:19.943074",
+  "host": {
+    "ENV": {},
+    "cpu": "12th Gen Intel(R) Core(TM) i7-12700KF",
+    "gpus": {
+      "driver_version": "591.86",
+      "gpus": [
+        {
+          "model": "NVIDIA GeForce RTX 3070 Ti",
+          "persistence_mode": false,
+          "total_memory": 8192
+        }
+      ]
+    },
+    "hostname": "ADOLF",
+    "os": [
+      "Windows",
+      "Windows-10-10.0.26100-SP0"
+    ],
+    "python_version": "3.9.0"
+  },
+  "meta": {
+    "command": "my_main",
+    "config_updates": {
+      "env_args": {
+        "key": "pz-mpe-simple-spread-v3",
+        "time_limit": 25
+      },
+      "use_wandb": true,
+      "wandb_mode": "online",
+      "wandb_project": "epymarl-mpe",
+      "wandb_team": "adolf9555"
+    },
+    "named_configs": [],
+    "options": {
+      "--beat-interval": null,
+      "--capture": null,
+      "--comment": null,
+      "--debug": false,
+      "--enforce_clean": false,
+      "--file_storage": null,
+      "--force": false,
+      "--help": false,
+      "--id": null,
+      "--loglevel": null,
+      "--mongo_db": null,
+      "--name": null,
+      "--pdb": false,
+      "--print-config": false,
+      "--priority": null,
+      "--queue": false,
+      "--s3": null,
+      "--sql": null,
+      "--tiny_db": null,
+      "--unobserved": false,
+      "COMMAND": null,
+      "UPDATE": [
+        "env_args.time_limit=25",
+        "env_args.key=pz-mpe-simple-spread-v3",
+        "use_wandb=True",
+        "wandb_team=adolf9555",
+        "wandb_project=epymarl-mpe",
+        "wandb_mode=online"
+      ],
+      "help": false,
+      "with": true
+    }
+  },
+  "resources": [],
+  "result": null,
+  "start_time": "2026-06-09T12:06:19.122209",
+  "status": "FAILED",
+  "stop_time": "2026-06-09T12:06:19.944073"
+}

@@ -1,0 +1,102 @@
+{
+  "artifacts": [],
+  "command": "my_main",
+  "experiment": {
+    "base_dir": "E:\\Vscode program\\epymarl-main\\src",
+    "dependencies": [
+      "numpy==2.0.2",
+      "sacred==0.8.7",
+      "torch==2.8.0"
+    ],
+    "mainfile": "main.py",
+    "name": "pymarl",
+    "repositories": [],
+    "sources": [
+      [
+        "main.py",
+        "_sources\\main_b2cc1db06d11795e4f8cf6a3b0165fa1.py"
+      ],
+      [
+        "run.py",
+        "_sources\\run_29fd448eb2929a57e5fd2547c431175b.py"
+      ],
+      [
+        "utils\\logging.py",
+        "_sources\\logging_45c20b85b5607ba32293115c960bdcf9.py"
+      ]
+    ]
+  },
+  "heartbeat": "2026-06-09T15:48:13.973481",
+  "host": {
+    "ENV": {},
+    "cpu": "12th Gen Intel(R) Core(TM) i7-12700KF",
+    "gpus": {
+      "driver_version": "591.86",
+      "gpus": [
+        {
+          "model": "NVIDIA GeForce RTX 3070 Ti",
+          "persistence_mode": false,
+          "total_memory": 8192
+        }
+      ]
+    },
+    "hostname": "ADOLF",
+    "os": [
+      "Windows",
+      "Windows-10-10.0.26100-SP0"
+    ],
+    "python_version": "3.9.0"
+  },
+  "meta": {
+    "command": "my_main",
+    "config_updates": {
+      "env_args": {
+        "key": "pz-mpe-simple-spread-v3",
+        "time_limit": 25
+      },
+      "use_wandb": true,
+      "wandb_mode": "online",
+      "wandb_project": "epymarl-mpe",
+      "wandb_team": "adolf9555-university-of-technology-sydney"
+    },
+    "named_configs": [],
+    "options": {
+      "--beat-interval": null,
+      "--capture": "no",
+      "--comment": null,
+      "--debug": false,
+      "--enforce_clean": false,
+      "--file_storage": null,
+      "--force": false,
+      "--help": false,
+      "--id": null,
+      "--loglevel": null,
+      "--mongo_db": null,
+      "--name": null,
+      "--pdb": false,
+      "--print-config": false,
+      "--priority": null,
+      "--queue": false,
+      "--s3": null,
+      "--sql": null,
+      "--tiny_db": null,
+      "--unobserved": false,
+      "COMMAND": null,
+      "UPDATE": [
+        "env_args.time_limit=25",
+        "env_args.key=pz-mpe-simple-spread-v3",
+        "use_wandb=True",
+        "wandb_team=adolf9555-university-of-technology-sydney",
+        "wandb_project=epymarl-mpe",
+        "wandb_mode=online"
+      ],
+      "help": false,
+      "with": true
+    }
+  },
+  "resources": [],
+  "result": null,
+  "start_time": "2026-06-09T12:27:21.511660",
+  "status": "COMPLETED",
+  "stop_time": "2026-06-09T15:48:13.972480"
+}

@@ -1,0 +1,21 @@
+2026-06-09 20:18:28,840 INFO    MainThread:41640 [wandb_setup.py:_flush():81] Current SDK version is 0.26.1
+2026-06-09 20:18:28,840 INFO    MainThread:41640 [wandb_setup.py:_flush():81] Configure stats pid to 41640
+2026-06-09 20:18:28,840 INFO    MainThread:41640 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2026-06-09 20:18:28,840 INFO    MainThread:41640 [wandb_init.py:setup_run_log_directory():723] Logging user logs to E:\Vscode program\epymarl-main\wandb\run-20260609_201828-deio2ao6\logs\debug.log
+2026-06-09 20:18:28,840 INFO    MainThread:41640 [wandb_init.py:setup_run_log_directory():724] Logging internal logs to E:\Vscode program\epymarl-main\wandb\run-20260609_201828-deio2ao6\logs\debug-internal.log
+2026-06-09 20:18:28,841 INFO    MainThread:41640 [wandb_init.py:init():850] calling init triggers
+2026-06-09 20:18:28,841 INFO    MainThread:41640 [wandb_init.py:init():855] wandb.init called with sweep_config: {}
+config: {'runner': 'parallel', 'mac': 'basic_mac', 'env': 'gymma', 'common_reward': True, 'reward_scalarisation': 'sum', 'env_args': {'key': 'pz-mpe-simple-spread-v3', 'time_limit': 2, 'pretrained_wrapper': None, 'seed': 525330163}, 'batch_size_run': 1, 'test_nepisode': 1, 'test_interval': 50000, 'test_greedy': True, 'log_interval': 50000, 'runner_log_interval': 10000, 'learner_log_interval': 10000, 't_max': 1, 'use_cuda': False, 'buffer_cpu_only': True, 'use_tensorboard': False, 'use_wandb': True, 'wandb_team': 'adolf9555-university-of-technology-sydney', 'wandb_project': 'epymarl-mpe', 'wandb_mode': 'online', 'wandb_save_model': False, 'save_model': False, 'save_model_interval': 50000, 'checkpoint_path': '', 'evaluate': False, 'render': False, 'load_step': 0, 'save_replay': False, 'local_results_path': 'results', 'gamma': 0.99, 'batch_size': 1, 'buffer_size': 1, 'lr': 0.0003, 'optim_alpha': 0.99, 'optim_eps': 1e-05, 'grad_norm_clip': 10, 'add_value_last_step': True, 'agent': 'rnn', 'hidden_dim': 128, 'obs_agent_id': True, 'obs_last_action': False, 'repeat_id': 1, 'label': 'default_label', 'hypergroup': None, 'action_selector': 'soft_policies', 'mask_before_softmax': True, 'target_update_interval_or_tau': 0.01, 'obs_individual_obs': False, 'agent_output_type': 'pi_logits', 'learner': 'ppo_learner', 'entropy_coef': 0.001, 'use_rnn': True, 'standardise_returns': False, 'standardise_rewards': True, 'q_nstep': 5, 'critic_type': 'cv_critic', 'epochs': 4, 'eps_clip': 0.2, 'name': 'mappo', 'seed': 525330163, '_wandb': {}}
+2026-06-09 20:18:28,841 INFO    MainThread:41640 [wandb_init.py:init():898] starting backend
+2026-06-09 20:18:31,165 INFO    MainThread:41640 [wandb_init.py:init():913] sending inform_init request
+2026-06-09 20:18:36,291 INFO    MainThread:41640 [wandb_init.py:init():918] backend started and connected
+2026-06-09 20:18:36,292 INFO    MainThread:41640 [wandb_init.py:init():988] updated telemetry
+2026-06-09 20:18:36,293 INFO    MainThread:41640 [wandb_init.py:init():1011] communicating run to backend with 90.0 second timeout
+2026-06-09 20:18:36,773 INFO    MainThread:41640 [wandb_init.py:init():1056] starting run threads in backend
+2026-06-09 20:18:36,824 INFO    MainThread:41640 [wandb_run.py:_console_start():2554] atexit reg
+2026-06-09 20:18:36,825 INFO    MainThread:41640 [wandb_run.py:_redirect():2403] redirect: off
+2026-06-09 20:18:36,827 INFO    MainThread:41640 [wandb_init.py:init():1094] run started, returning control to user process
+2026-06-09 20:18:38,946 INFO    MainThread:41640 [wandb_run.py:_finish():2321] finishing run adolf9555-university-of-technology-sydney/epymarl-mpe/deio2ao6
+2026-06-09 20:18:38,946 INFO    MainThread:41640 [wandb_run.py:_atexit_cleanup():2520] got exitcode: 0
+2026-06-09 20:18:38,947 INFO    MainThread:41640 [wandb_run.py:_restore():2502] restore
+2026-06-09 20:18:38,947 INFO    MainThread:41640 [wandb_run.py:_restore():2508] restore done

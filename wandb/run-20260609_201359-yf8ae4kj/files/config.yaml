@@ -1,0 +1,193 @@
+_wandb:
+    value:
+        cli_version: 0.26.1
+        e:
+            rzi9igenjgf20d1k7yf9zdsmcat37flk:
+                args:
+                    - --config=mappo
+                    - --env-config=gymma
+                    - with
+                    - env_args.time_limit=2
+                    - env_args.key=pz-mpe-simple-spread-v3
+                    - t_max=1
+                    - test_nepisode=1
+                    - batch_size_run=1
+                    - batch_size=1
+                    - buffer_size=1
+                    - use_cuda=False
+                    - use_wandb=True
+                    - wandb_team=adolf9555-university-of-technology-sydney
+                    - wandb_project=epymarl-mpe
+                    - wandb_mode=online
+                codePath: src\main.py
+                codePathLocal: src\main.py
+                cpu_count: 12
+                cpu_count_logical: 20
+                cudaVersion: "13.1"
+                disk:
+                    /:
+                        total: "415098728448"
+                        used: "99227770880"
+                executable: E:\Vscode program\epymarl-main\MPE\Scripts\python.exe
+                gpu: NVIDIA GeForce RTX 3070 Ti
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 6144
+                      memoryTotal: "8589934592"
+                      name: NVIDIA GeForce RTX 3070 Ti
+                      uuid: GPU-40fbe769-9b23-daac-cff7-0773fef15845
+                host: ADOLF
+                memory:
+                    total: "34164105216"
+                os: Windows-10-10.0.26100-SP0
+                program: E:\Vscode program\epymarl-main\src\main.py
+                python: CPython 3.9.0
+                root: E:\Vscode program\epymarl-main
+                startedAt: "2026-06-09T12:13:59.633592Z"
+                writerId: rzi9igenjgf20d1k7yf9zdsmcat37flk
+        m: []
+        python_version: 3.9.0
+        t:
+            "1":
+                - 1
+                - 52
+            "2":
+                - 1
+                - 52
+            "3":
+                - 2
+                - 16
+                - 61
+            "4": 3.9.0
+            "5": 0.26.1
+            "8":
+                - 3
+            "12": 0.26.1
+            "13": windows-amd64
+action_selector:
+    value: soft_policies
+add_value_last_step:
+    value: true
+agent:
+    value: rnn
+agent_output_type:
+    value: pi_logits
+batch_size:
+    value: 1
+batch_size_run:
+    value: 1
+buffer_cpu_only:
+    value: true
+buffer_size:
+    value: 1
+checkpoint_path:
+    value: ""
+common_reward:
+    value: true
+critic_type:
+    value: cv_critic
+entropy_coef:
+    value: 0.001
+env:
+    value: gymma
+env_args:
+    value:
+        key: pz-mpe-simple-spread-v3
+        pretrained_wrapper: null
+        seed: 218324788
+        time_limit: 2
+epochs:
+    value: 4
+eps_clip:
+    value: 0.2
+evaluate:
+    value: false
+gamma:
+    value: 0.99
+grad_norm_clip:
+    value: 10
+hidden_dim:
+    value: 128
+hypergroup:
+    value: null
+label:
+    value: default_label
+learner:
+    value: ppo_learner
+learner_log_interval:
+    value: 10000
+load_step:
+    value: 0
+local_results_path:
+    value: results
+log_interval:
+    value: 50000
+lr:
+    value: 0.0003
+mac:
+    value: basic_mac
+mask_before_softmax:
+    value: true
+name:
+    value: mappo
+obs_agent_id:
+    value: true
+obs_individual_obs:
+    value: false
+obs_last_action:
+    value: false
+optim_alpha:
+    value: 0.99
+optim_eps:
+    value: 1e-05
+q_nstep:
+    value: 5
+render:
+    value: false
+repeat_id:
+    value: 1
+reward_scalarisation:
+    value: sum
+runner:
+    value: parallel
+runner_log_interval:
+    value: 10000
+save_model:
+    value: false
+save_model_interval:
+    value: 50000
+save_replay:
+    value: false
+seed:
+    value: 218324788
+standardise_returns:
+    value: false
+standardise_rewards:
+    value: true
+t_max:
+    value: 1
+target_update_interval_or_tau:
+    value: 0.01
+test_greedy:
+    value: true
+test_interval:
+    value: 50000
+test_nepisode:
+    value: 1
+use_cuda:
+    value: false
+use_rnn:
+    value: true
+use_tensorboard:
+    value: false
+use_wandb:
+    value: true
+wandb_mode:
+    value: online
+wandb_project:
+    value: epymarl-mpe
+wandb_save_model:
+    value: false
+wandb_team:
+    value: adolf9555-university-of-technology-sydney

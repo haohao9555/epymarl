@@ -1,0 +1,43 @@
+_wandb:
+    value:
+        cli_version: 0.26.1
+        e:
+            lp2fluccxavkyd6vc69so9olen5m8ht3:
+                cpu_count: 12
+                cpu_count_logical: 20
+                cudaVersion: "13.1"
+                disk:
+                    /:
+                        total: "415098728448"
+                        used: "99227717632"
+                executable: E:\Vscode program\epymarl-main\MPE\Scripts\python.exe
+                gpu: NVIDIA GeForce RTX 3070 Ti
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 6144
+                      memoryTotal: "8589934592"
+                      name: NVIDIA GeForce RTX 3070 Ti
+                      uuid: GPU-40fbe769-9b23-daac-cff7-0773fef15845
+                host: ADOLF
+                memory:
+                    total: "34164105216"
+                os: Windows-10-10.0.26100-SP0
+                program: <python with no main file>
+                python: CPython 3.9.0
+                root: E:\Vscode program\epymarl-main
+                startedAt: "2026-06-09T12:10:38.218078Z"
+                writerId: lp2fluccxavkyd6vc69so9olen5m8ht3
+        m: []
+        python_version: 3.9.0
+        t:
+            "3":
+                - 2
+                - 13
+                - 61
+            "4": 3.9.0
+            "5": 0.26.1
+            "8":
+                - 3
+            "12": 0.26.1
+            "13": windows-amd64
