@@ -6,6 +6,11 @@ from gymnasium.spaces import flatdim
 from gymnasium.wrappers import TimeLimit
 import numpy as np
 
+# ------ 新增：引入 Box 用于连续动作空间检测 ----------
+# -----------------------------------------------------------------------------
+from gymnasium.spaces import Box
+# -----------------------------------------------------------------------------
+
 from .multiagentenv import MultiAgentEnv
 from .wrappers import FlattenObservation
 import envs.pretrained as pretrained  # noqa
@@ -48,7 +53,15 @@ class GymmaWrapper(MultiAgentEnv):
         self._obs = None
         self._info = None
 
-        self.longest_action_space = max(self._env.action_space, key=lambda x: x.n)
+        # ------ 新增：自动检测动作空间类型，Box=连续，否则=离散 ----------
+        # -----------------------------------------------------------------------------
+        self._continuous = isinstance(self._env.action_space[0], Box)
+        if self._continuous:
+            self.longest_action_space = max(self._env.action_space, key=lambda x: flatdim(x))
+        else:
+            self.longest_action_space = max(self._env.action_space, key=lambda x: x.n)
+        # -----------------------------------------------------------------------------
+
         self.longest_observation_space = max(
             self._env.observation_space, key=lambda x: x.shape
         )
@@ -83,7 +96,13 @@ class GymmaWrapper(MultiAgentEnv):
 
     def step(self, actions):
         """Returns obss, reward, terminated, truncated, info"""
-        actions = [int(a) for a in actions]
+        # ------ 改：连续动作转 float32 数组，离散保持 int ----------
+        # -----------------------------------------------------------------------------
+        if self._continuous:
+            actions = [np.array(a, dtype=np.float32) for a in actions]
+        else:
+            actions = [int(a) for a in actions]
+        # -----------------------------------------------------------------------------
         obs, reward, done, truncated, self._info = self._env.step(actions)
         self._obs = self._pad_observation(obs)
 
@@ -128,6 +147,11 @@ class GymmaWrapper(MultiAgentEnv):
 
     def get_avail_agent_actions(self, agent_id):
         """Returns the available actions for agent_id"""
+        # ------ 改：连续动作无可用/不可用概念，返回全 1；离散保持原逻辑 ----------
+        # -----------------------------------------------------------------------------
+        if self._continuous:
+            return [1] * flatdim(self._env.action_space[agent_id])
+        # -----------------------------------------------------------------------------
         valid = flatdim(self._env.action_space[agent_id]) * [1]
         invalid = [0] * (self.longest_action_space.n - len(valid))
         return valid + invalid
@@ -157,3 +181,11 @@ class GymmaWrapper(MultiAgentEnv):
 
     def get_stats(self):
         return {}
+
+    # ------ 新增：覆写 get_env_info，传递 continuous_actions 标志给 run.py ----------
+    # -----------------------------------------------------------------------------
+    def get_env_info(self):
+        info = super().get_env_info()
+        info["continuous_actions"] = self._continuous
+        return info
+    # -----------------------------------------------------------------------------

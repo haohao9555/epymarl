@@ -10,6 +10,10 @@ from .fpo_learner import PPOLearner as FPOLearner
 #----------------------
 from .ppo_learner import PPOLearner
 
+# ------ 新增：导入连续动作 Learner ----------
+# -----------------------------------------------------------------------------
+from .ppo_continuous_learner import PPOContinuousLearner
+# -----------------------------------------------------------------------------
 
 REGISTRY = {}
 REGISTRY["q_learner"] = QLearner
@@ -23,3 +27,8 @@ REGISTRY["fpo_learner"] = FPOLearner
 REGISTRY["ppo_learner"] = PPOLearner
 REGISTRY["pac_learner"] = PACActorCriticLearner
 REGISTRY["pac_dcg_learner"] = PACDCGLearner
+
+# ------ 新增 ----------
+# -----------------------------------------------------------------------------
+REGISTRY["ppo_continuous_learner"] = PPOContinuousLearner
+# -----------------------------------------------------------------------------

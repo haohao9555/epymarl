@@ -1,16 +1,21 @@
 import torch as th
-from torch.distributions import Categorical
+from torch.distributions import Beta, Categorical
+
 from .epsilon_schedules import DecayThenFlatSchedule
+
 REGISTRY = {}
 
 
-class MultinomialActionSelector():
-
+class MultinomialActionSelector:
     def __init__(self, args):
         self.args = args
 
-        self.schedule = DecayThenFlatSchedule(args.epsilon_start, args.epsilon_finish, args.epsilon_anneal_time,
-                                              decay="linear")
+        self.schedule = DecayThenFlatSchedule(
+            args.epsilon_start,
+            args.epsilon_finish,
+            args.epsilon_anneal_time,
+            decay="linear",
+        )
         self.epsilon = self.schedule.eval(0)
         self.test_greedy = getattr(args, "test_greedy", True)
 
@@ -31,41 +36,43 @@ class MultinomialActionSelector():
 REGISTRY["multinomial"] = MultinomialActionSelector
 
 
-class EpsilonGreedyActionSelector():
-
+class EpsilonGreedyActionSelector:
     def __init__(self, args):
         self.args = args
 
-        self.schedule = DecayThenFlatSchedule(args.epsilon_start, args.epsilon_finish, args.epsilon_anneal_time,
-                                              decay="linear")
+        self.schedule = DecayThenFlatSchedule(
+            args.epsilon_start,
+            args.epsilon_finish,
+            args.epsilon_anneal_time,
+            decay="linear",
+        )
         self.epsilon = self.schedule.eval(0)
 
     def select_action(self, agent_inputs, avail_actions, t_env, test_mode=False):
-
-        # Assuming agent_inputs is a batch of Q-Values for each agent bav
+        # Assuming agent_inputs is a batch of Q-values for each agent.
         self.epsilon = self.schedule.eval(t_env)
 
         if test_mode:
-            # Greedy action selection only
             self.epsilon = self.args.evaluation_epsilon
 
-        # mask actions that are excluded from selection
         masked_q_values = agent_inputs.clone()
-        masked_q_values[avail_actions == 0.0] = -float("inf")  # should never be selected!
+        masked_q_values[avail_actions == 0.0] = -float("inf")
 
         random_numbers = th.rand_like(agent_inputs[:, :, 0])
         pick_random = (random_numbers < self.epsilon).long()
         random_actions = Categorical(avail_actions.float()).sample().long()
 
-        picked_actions = pick_random * random_actions + (1 - pick_random) * masked_q_values.max(dim=2)[1]
+        picked_actions = (
+            pick_random * random_actions
+            + (1 - pick_random) * masked_q_values.max(dim=2)[1]
+        )
         return picked_actions
 
 
 REGISTRY["epsilon_greedy"] = EpsilonGreedyActionSelector
 
 
-class SoftPoliciesSelector():
-
+class SoftPoliciesSelector:
     def __init__(self, args):
         self.args = args
 
@@ -76,3 +83,19 @@ class SoftPoliciesSelector():
 
 
 REGISTRY["soft_policies"] = SoftPoliciesSelector
+
+
+class BetaActionSelector:
+    def __init__(self, args):
+        self.args = args
+
+    def select_action(self, agent_inputs, avail_actions, t_env, test_mode=False):
+        alpha, beta = agent_inputs.chunk(2, dim=-1)
+        if test_mode:
+            return alpha / (alpha + beta)
+        return Beta(alpha, beta).sample()
+
+
+REGISTRY["beta"] = BetaActionSelector
+# Backwards-compatible alias for older local continuous configs.
+REGISTRY["gaussian"] = BetaActionSelector

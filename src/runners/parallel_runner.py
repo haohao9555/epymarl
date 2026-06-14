@@ -134,7 +134,7 @@ class ParallelRunner:
                 bs=envs_not_terminated,
                 test_mode=test_mode,
             )
-            cpu_actions = actions.to("cpu").numpy()
+            cpu_actions = actions.detach().to("cpu").numpy()
 
             # Update the actions taken
             actions_chosen = {"actions": actions.unsqueeze(1)}

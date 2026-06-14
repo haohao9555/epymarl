@@ -106,10 +106,21 @@ def run_sequential(args, logger):
     args.state_shape = env_info["state_shape"]
 
     # Default/Base scheme
+    # ------ 改：根据 continuous_actions 标志选择 actions 的存储格式和 preprocess ----------
+    # -----------------------------------------------------------------------------
+    _continuous = env_info.get("continuous_actions", False)
+    # -----------------------------------------------------------------------------
     scheme = {
         "state": {"vshape": env_info["state_shape"]},
         "obs": {"vshape": env_info["obs_shape"], "group": "agents"},
-        "actions": {"vshape": (1,), "group": "agents", "dtype": th.long},
+        # ------ 改：连续动作存浮点向量，离散存单个 long 索引 ----------
+        # -----------------------------------------------------------------------------
+        "actions": (
+            {"vshape": (env_info["n_actions"],), "group": "agents", "dtype": th.float32}
+            if _continuous else
+            {"vshape": (1,), "group": "agents", "dtype": th.long}
+        ),
+        # -----------------------------------------------------------------------------
         "avail_actions": {
             "vshape": (env_info["n_actions"],),
             "group": "agents",
@@ -140,7 +151,13 @@ def run_sequential(args, logger):
         }
     #----------------------
     groups = {"agents": args.n_agents}
-    preprocess = {"actions": ("actions_onehot", [OneHot(out_dim=args.n_actions)])}
+    # ------ 改：连续动作不需要 one-hot 预处理，离散保持原逻辑 ----------
+    # -----------------------------------------------------------------------------
+    if _continuous:
+        preprocess = {}
+    else:
+        preprocess = {"actions": ("actions_onehot", [OneHot(out_dim=args.n_actions)])}
+    # -----------------------------------------------------------------------------
 
     buffer = ReplayBuffer(
         scheme,
