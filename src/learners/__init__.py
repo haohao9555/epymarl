@@ -13,6 +13,7 @@ from .ppo_learner import PPOLearner
 # ------ 新增：导入连续动作 Learner ----------
 # -----------------------------------------------------------------------------
 from .ppo_continuous_learner import PPOContinuousLearner
+from .fpo_continuous_learner import FPOContinuousLearner
 # -----------------------------------------------------------------------------
 
 REGISTRY = {}
@@ -31,4 +32,5 @@ REGISTRY["pac_dcg_learner"] = PACDCGLearner
 # ------ 新增 ----------
 # -----------------------------------------------------------------------------
 REGISTRY["ppo_continuous_learner"] = PPOContinuousLearner
+REGISTRY["fpo_continuous_learner"] = FPOContinuousLearner
 # -----------------------------------------------------------------------------

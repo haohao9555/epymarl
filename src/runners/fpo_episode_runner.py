@@ -87,8 +87,16 @@ class FPOEpisodeRunner:
             ),
         )
 
-    #---------------新增：rollout 初始 CFM loss 占位计算------------------------------
-    def compute_initial_cfm_loss(self, cfm_eps):
+    #------改：initial_cfm_loss 从全零占位改为调用 MAC 真实计算----------
+    #-----------------------------
+    def compute_initial_cfm_loss(self, cfm_eps, cfm_t, actions):
+        """调用 MAC 的流网络计算当前策略的 CFM loss，作为 rho_s 的基准。
+
+        若 MAC 不支持（如旧版 ContinuousMAC），回退为全零占位。
+        """
+        if hasattr(self.mac, "compute_initial_cfm_loss"):
+            return self.mac.compute_initial_cfm_loss(cfm_eps, cfm_t, actions)
+        # 旧版 MAC 回退：全零占位
         return th.zeros(
             self.batch_size,
             self.args.n_agents,
@@ -96,7 +104,7 @@ class FPOEpisodeRunner:
             1,
             device=self.batch.device,
         )
-    #----------------------
+    #-----------------------------
 
     def run(self, test_mode=False):
         self.reset()
@@ -122,6 +130,7 @@ class FPOEpisodeRunner:
             actions = self.mac.select_actions(
                 self.batch, t_ep=self.t, t_env=self.t_env, test_mode=test_mode
             )
+            actions = actions.detach()
             #---------------新增：rollout 为同一条轨迹存储固定 CFM 采样点------------------------------
             cfm_eps, cfm_t = self.sample_cfm_points()
             #----------------------
@@ -134,11 +143,14 @@ class FPOEpisodeRunner:
 
             post_transition_data = {
                 "actions": actions,
-                #---------------新增：rollout 存储 initial_cfm_loss------------------------------
+                #------改：initial_cfm_loss 改为真实计算，传入 actions 供流网络使用----------
+                #-----------------------------
                 "cfm_eps": cfm_eps,
                 "cfm_t": cfm_t,
-                "initial_cfm_loss": self.compute_initial_cfm_loss(cfm_eps),
-                #----------------------
+                "initial_cfm_loss": self.compute_initial_cfm_loss(
+                    cfm_eps, cfm_t, actions
+                ),
+                #-----------------------------
                 "terminated": [(terminated != env_info.get("episode_limit", False),)],
             }
             if self.args.common_reward:
@@ -163,17 +175,21 @@ class FPOEpisodeRunner:
         actions = self.mac.select_actions(
             self.batch, t_ep=self.t, t_env=self.t_env, test_mode=test_mode
         )
+        actions = actions.detach()
         #---------------新增：最后状态存储固定 CFM 采样点------------------------------
         cfm_eps, cfm_t = self.sample_cfm_points()
         #----------------------
         self.batch.update(
             {
                 "actions": actions,
-                #---------------新增：最后状态存储 initial_cfm_loss------------------------------
+                #------改：最后状态 initial_cfm_loss 同步改为真实计算----------
+                #-----------------------------
                 "cfm_eps": cfm_eps,
                 "cfm_t": cfm_t,
-                "initial_cfm_loss": self.compute_initial_cfm_loss(cfm_eps),
-                #----------------------
+                "initial_cfm_loss": self.compute_initial_cfm_loss(
+                    cfm_eps, cfm_t, actions
+                ),
+                #-----------------------------
             },
             ts=self.t,
         )
@@ -199,7 +215,7 @@ class FPOEpisodeRunner:
             self._log(cur_returns, cur_stats, log_prefix)
         elif self.t_env - self.log_train_stats_t >= self.args.runner_log_interval:
             self._log(cur_returns, cur_stats, log_prefix)
-            if hasattr(self.mac.action_selector, "epsilon"):
+            if hasattr(self.mac, "action_selector") and hasattr(self.mac.action_selector, "epsilon"):
                 self.logger.log_stat(
                     "epsilon", self.mac.action_selector.epsilon, self.t_env
                 )

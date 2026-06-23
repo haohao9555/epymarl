@@ -7,6 +7,7 @@ from .maddpg_controller import MADDPGMAC
 # ------ 新增：注册连续动作 MAC ----------
 # -----------------------------------------------------------------------------
 from .continuous_mac import ContinuousMAC
+from .fpo_mac import FPOMAC
 # -----------------------------------------------------------------------------
 
 REGISTRY["basic_mac"] = BasicMAC
@@ -16,4 +17,5 @@ REGISTRY["maddpg_mac"] = MADDPGMAC
 # ------ 新增 ----------
 # -----------------------------------------------------------------------------
 REGISTRY["continuous_mac"] = ContinuousMAC
+REGISTRY["fpo_mac"] = FPOMAC
 # -----------------------------------------------------------------------------

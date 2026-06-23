@@ -6,6 +6,8 @@ from .fpo_agent import RNNAgent as FPOAgent
 # ------ 新增：注册连续动作 Agent ----------
 # -----------------------------------------------------------------------------
 from .rnn_continuous_agent import RNNContinuousAgent
+from .fpo_continuous_agent import FPOContinuousAgent
+from .fpo_actor import FPOActor
 # -----------------------------------------------------------------------------
 
 REGISTRY = {}
@@ -17,4 +19,6 @@ REGISTRY["fpo_agent"] = FPOAgent
 # ------ 新增 ----------
 # -----------------------------------------------------------------------------
 REGISTRY["rnn_continuous"] = RNNContinuousAgent
+REGISTRY["fpo_continuous"] = FPOContinuousAgent
+REGISTRY["fpo_actor"] = FPOActor
 # -----------------------------------------------------------------------------
