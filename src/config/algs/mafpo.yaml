@@ -21,6 +21,7 @@ cfm_loss_clamp: 5.0
 fpo_rollout_timesteps: 2048
 epochs: 4
 eps_clip: 0.2
+gae_lambda: 0.95
 
 target_update_interval_or_tau: 0.01
 

@@ -235,12 +235,17 @@ class FPODiscreteLearner:
 
     def train_critic_sequential(self, critic, target_critic, batch, rewards, mask):
         with th.no_grad():
-            target_vals = target_critic(batch).squeeze(3)
+            target_vals = target_critic(batch).squeeze(3)   # [B, T+1, N]
 
         if self.args.standardise_returns:
             target_vals = target_vals * th.sqrt(self.ret_ms.var) + self.ret_ms.mean
 
-        target_returns = self.nstep_returns(rewards, mask, target_vals, self.args.q_nstep)
+        terminated = batch["terminated"][:, :-1].float()   # [B, T, 1]
+        gae_lambda = getattr(self.args, "gae_lambda", 0.95)
+        advantages = self.compute_gae(
+            rewards, mask, target_vals, terminated, self.args.gamma, gae_lambda
+        )                                                   # [B, T, N], masked
+        target_returns = advantages + target_vals[:, :-1]  # λ-returns for critic
 
         if self.args.standardise_returns:
             self.ret_ms.update(target_returns)
@@ -249,7 +254,7 @@ class FPODiscreteLearner:
         running_log = {k: [] for k in ["critic_loss", "critic_grad_norm",
                                         "td_error_abs", "target_mean", "value_mean"]}
 
-        v = critic(batch)[:, :-1].squeeze(3)
+        v = critic(batch)[:, :-1].squeeze(3)               # [B, T, N]
         td_error = target_returns.detach() - v
         masked_td_error = td_error * mask
         loss = (masked_td_error ** 2).sum() / mask.sum()
@@ -265,25 +270,30 @@ class FPODiscreteLearner:
         running_log["td_error_abs"].append(masked_td_error.abs().sum().item() / mask_elems)
         running_log["value_mean"].append((v * mask).sum().item() / mask_elems)
         running_log["target_mean"].append((target_returns * mask).sum().item() / mask_elems)
-        return masked_td_error, running_log
+        return advantages, running_log
 
-    def nstep_returns(self, rewards, mask, values, nsteps):
-        nstep_values = th.zeros_like(values[:, :-1])
-        for t_start in range(rewards.size(1)):
-            nstep_return_t = th.zeros_like(values[:, 0])
-            for step in range(nsteps + 1):
-                t = t_start + step
-                if t >= rewards.size(1):
-                    break
-                elif step == nsteps:
-                    nstep_return_t += self.args.gamma ** step * values[:, t] * mask[:, t]
-                elif t == rewards.size(1) - 1 and self.args.add_value_last_step:
-                    nstep_return_t += self.args.gamma ** step * rewards[:, t] * mask[:, t]
-                    nstep_return_t += self.args.gamma ** (step + 1) * values[:, t + 1]
-                else:
-                    nstep_return_t += self.args.gamma ** step * rewards[:, t] * mask[:, t]
-            nstep_values[:, t_start, :] = nstep_return_t
-        return nstep_values
+    def compute_gae(self, rewards, mask, values, terminated, gamma, gae_lambda):
+        """GAE advantage estimation (backward pass).
+
+        rewards:    [B, T, N]
+        mask:       [B, T, N]
+        values:     [B, T+1, N]  target critic values (includes bootstrap at T)
+        terminated: [B, T, 1]    1 if episode ended at step t
+        Returns:    advantages [B, T, N], zeroed at invalid steps
+        """
+        T = rewards.size(1)
+        gae = th.zeros_like(values[:, 0])    # [B, N]
+        advantages = th.zeros_like(rewards)   # [B, T, N]
+
+        for t in reversed(range(T)):
+            next_non_terminal = 1.0 - terminated[:, t]   # [B, 1], broadcast over N
+            delta = (rewards[:, t]
+                     + gamma * values[:, t + 1] * next_non_terminal
+                     - values[:, t])
+            gae = delta + gamma * gae_lambda * next_non_terminal * gae
+            advantages[:, t] = gae
+
+        return advantages * mask
 
     def _mean_stat(self, values):
         return sum(values) / max(1, len(values))
