@@ -69,7 +69,7 @@ class Logger:
             project=project_name,
             config=config,
             group=group_name,
-            name="MAPPO-MPE",
+            name=config.get("wandb_run_name") or alg_name,
             mode=mode,
             settings=wandb.Settings(console="off"),
         )

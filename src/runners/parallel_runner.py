@@ -2,6 +2,7 @@ from functools import partial
 from multiprocessing import Pipe, Process
 
 import numpy as np
+import torch as th
 
 from components.episode_buffer import EpisodeBatch
 from envs import REGISTRY as env_REGISTRY
@@ -75,6 +76,27 @@ class ParallelRunner:
         self.scheme = scheme
         self.groups = groups
         self.preprocess = preprocess
+        self.collect_cfm = all(
+            key in scheme for key in ("cfm_eps", "cfm_t", "initial_cfm_loss")
+        )
+
+    def sample_cfm_points(self, batch_size):
+        return (
+            th.randn(
+                batch_size,
+                self.args.n_agents,
+                self.args.cfm_n_samples,
+                self.args.cfm_action_dim,
+                device=self.batch.device,
+            ),
+            th.rand(
+                batch_size,
+                self.args.n_agents,
+                self.args.cfm_n_samples,
+                1,
+                device=self.batch.device,
+            ),
+        )
 
     def get_env_info(self):
         return self.env_info
@@ -136,8 +158,23 @@ class ParallelRunner:
             )
             cpu_actions = actions.detach().to("cpu").numpy()
 
-            # Update the actions taken
-            actions_chosen = {"actions": actions.unsqueeze(1)}
+            # Store the action and, for FPO, the fixed CFM points evaluated
+            # under the rollout policy that generated this transition.
+            actions_chosen = {"actions": actions.detach().unsqueeze(1)}
+            if self.collect_cfm:
+                cfm_eps, cfm_t = self.sample_cfm_points(len(envs_not_terminated))
+                actions_chosen.update(
+                    {
+                        "cfm_eps": cfm_eps.unsqueeze(1),
+                        "cfm_t": cfm_t.unsqueeze(1),
+                        "initial_cfm_loss": self.mac.compute_initial_cfm_loss(
+                            cfm_eps,
+                            cfm_t,
+                            actions,
+                            bs=envs_not_terminated,
+                        ).unsqueeze(1),
+                    }
+                )
             self.batch.update(
                 actions_chosen, bs=envs_not_terminated, ts=self.t, mark_filled=False
             )
@@ -244,7 +281,9 @@ class ParallelRunner:
             self._log(cur_returns, cur_stats, log_prefix)
         elif self.t_env - self.log_train_stats_t >= self.args.runner_log_interval:
             self._log(cur_returns, cur_stats, log_prefix)
-            if hasattr(self.mac.action_selector, "epsilon"):
+            if hasattr(self.mac, "action_selector") and hasattr(
+                self.mac.action_selector, "epsilon"
+            ):
                 self.logger.log_stat(
                     "epsilon", self.mac.action_selector.epsilon, self.t_env
                 )

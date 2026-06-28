@@ -8,6 +8,7 @@ from .fpo_agent import RNNAgent as FPOAgent
 from .rnn_continuous_agent import RNNContinuousAgent
 from .fpo_continuous_agent import FPOContinuousAgent
 from .fpo_actor import FPOActor
+from .fpo_discrete_agent import FPODiscreteAgent
 # -----------------------------------------------------------------------------
 
 REGISTRY = {}
@@ -21,4 +22,5 @@ REGISTRY["fpo_agent"] = FPOAgent
 REGISTRY["rnn_continuous"] = RNNContinuousAgent
 REGISTRY["fpo_continuous"] = FPOContinuousAgent
 REGISTRY["fpo_actor"] = FPOActor
+REGISTRY["fpo_discrete_agent"] = FPODiscreteAgent
 # -----------------------------------------------------------------------------

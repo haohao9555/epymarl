@@ -1,28 +1,29 @@
 # --- Continuous MAFPO/FPO parameters for Box(0, 1) action spaces ---
 
-runner: "fpo_episode"
+runner: "parallel"
 mac: "fpo_mac"
 agent: "fpo_actor"
 learner: "fpo_continuous_learner"
 critic_type: "fpo_critic"
 
-# FPOEpisodeRunner is sequential, so each rollout call collects one full episode.
-batch_size_run: 1
+# Collect independent environments in subprocesses under one training run.
+batch_size_run: 8
 
 # Keep enough complete episodes to cover roughly 2048 transitions, then clear
 # the buffer after one on-policy train call.
 buffer_size: 128
-batch_size: 1
+batch_size: 8
 fpo_rollout_timesteps: 2048
 
 # Each environment timestep stores this many fixed CFM neighbourhood points.
-cfm_n_samples: 50
+cfm_n_samples: 10
 cfm_rho_clip: 3.0
 cfm_target_type: "velocity"
+cfm_reg_coef: 0.5
 
 # Shuffle the collected rollout transitions and train for 10 passes.
 fpo_minibatch_size: 256
-epochs: 10
+epochs: 4
 
 target_update_interval_or_tau: 0.01
 
@@ -34,7 +35,7 @@ obs_last_action: False
 obs_individual_obs: False
 
 use_rnn: True
-standardise_returns: False
+standardise_returns: True
 standardise_rewards: True
 q_nstep: 5
 eps_clip: 0.2
@@ -43,6 +44,7 @@ name: "mafpo_continuous"
 use_wandb: True
 wandb_team: "adolf9555-university-of-technology-sydney"
 wandb_project: "epymarl-mpe"
+wandb_run_name: "MAFPO-MPE"
 wandb_mode: "online"
 
 t_max: 20050000

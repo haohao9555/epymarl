@@ -8,6 +8,7 @@ from .maddpg_controller import MADDPGMAC
 # -----------------------------------------------------------------------------
 from .continuous_mac import ContinuousMAC
 from .fpo_mac import FPOMAC
+from .fpo_discrete_mac import FPODiscreteMAC
 # -----------------------------------------------------------------------------
 
 REGISTRY["basic_mac"] = BasicMAC
@@ -18,4 +19,5 @@ REGISTRY["maddpg_mac"] = MADDPGMAC
 # -----------------------------------------------------------------------------
 REGISTRY["continuous_mac"] = ContinuousMAC
 REGISTRY["fpo_mac"] = FPOMAC
+REGISTRY["fpo_discrete_mac"] = FPODiscreteMAC
 # -----------------------------------------------------------------------------

@@ -1,0 +1,47 @@
+# --- Discrete MAFPO parameters (CFM-based rho, one-hot action space) ---
+
+runner: "parallel"
+common_reward: False
+mac: "fpo_discrete_mac"
+agent: "fpo_discrete_agent"
+learner: "fpo_discrete_learner"
+critic_type: "cv_critic"
+
+batch_size_run: 8
+buffer_size: 128
+batch_size: 8
+fpo_minibatch_size: 256
+
+# CFM neighbourhood points sampled per transition.
+cfm_n_samples: 10
+cfm_rho_clip: 3.0
+cfm_reg_coef: 0.5
+cfm_loss_clamp: 5.0
+
+fpo_rollout_timesteps: 2048
+epochs: 4
+eps_clip: 0.2
+
+target_update_interval_or_tau: 0.01
+
+lr: 0.0003
+hidden_dim: 128
+
+obs_agent_id: True
+obs_last_action: False
+obs_individual_obs: False
+
+use_rnn: True
+standardise_returns: False
+standardise_rewards: True
+q_nstep: 5
+
+name: "mafpo"
+
+use_wandb: True
+wandb_team: "adolf9555-university-of-technology-sydney"
+wandb_project: "epymarl-mpe"
+wandb_run_name: "MAFPO-MPE-Discrete"
+wandb_mode: "online"
+
+t_max: 20050000

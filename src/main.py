@@ -119,7 +119,7 @@ if __name__ == "__main__":
         if param.startswith("env_args.map_name"):
             map_name = param.split("=")[1]
         elif param.startswith("env_args.key"):
-            map_name = param.split("=")[1]
+            map_name = param.split("=")[1].replace(":", "_")
 
     # Save to disk by default for sacred
     logger.info("Saving to FileStorageObserver in results/sacred.")

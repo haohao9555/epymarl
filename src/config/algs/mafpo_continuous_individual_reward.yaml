@@ -1,6 +1,6 @@
 # --- Continuous MAFPO/FPO with individual per-agent rewards ---
 
-runner: "fpo_episode"
+runner: "parallel"
 mac: "fpo_mac"
 agent: "fpo_actor"
 learner: "fpo_continuous_learner"
@@ -9,19 +9,20 @@ critic_type: "fpo_critic"
 # Keep each agent's reward separate instead of summing to a common team reward.
 common_reward: False
 
-# FPOEpisodeRunner is sequential, so each rollout call collects one full episode.
-batch_size_run: 1
+# Collect independent environments in subprocesses under one training run.
+batch_size_run: 8
 
 # Keep enough complete episodes to cover roughly 2048 transitions, then clear
 # the buffer after one on-policy train call.
 buffer_size: 128
-batch_size: 1
+batch_size: 8
 fpo_rollout_timesteps: 2048
 
 # Each environment timestep stores this many fixed CFM neighbourhood points.
 cfm_n_samples: 50
 cfm_rho_clip: 3.0
 cfm_target_type: "velocity"
+cfm_reg_coef: 0.5
 
 # Shuffle the collected rollout transitions and train for 10 passes.
 fpo_minibatch_size: 256
@@ -46,6 +47,7 @@ name: "mafpo_continuous_individual_reward"
 use_wandb: True
 wandb_team: "adolf9555-university-of-technology-sydney"
 wandb_project: "epymarl-mpe"
+wandb_run_name: "MAFPO-MPE"
 wandb_mode: "online"
 
 t_max: 20050000

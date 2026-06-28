@@ -14,6 +14,7 @@ from .ppo_learner import PPOLearner
 # -----------------------------------------------------------------------------
 from .ppo_continuous_learner import PPOContinuousLearner
 from .fpo_continuous_learner import FPOContinuousLearner
+from .fpo_discrete_learner import FPODiscreteLearner  # CFM-based rho, discrete action space
 # -----------------------------------------------------------------------------
 
 REGISTRY = {}
@@ -33,4 +34,5 @@ REGISTRY["pac_dcg_learner"] = PACDCGLearner
 # -----------------------------------------------------------------------------
 REGISTRY["ppo_continuous_learner"] = PPOContinuousLearner
 REGISTRY["fpo_continuous_learner"] = FPOContinuousLearner
+REGISTRY["fpo_discrete_learner"] = FPODiscreteLearner
 # -----------------------------------------------------------------------------

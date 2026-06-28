@@ -138,7 +138,7 @@ def run_sequential(args, logger):
     else:
         scheme["reward"] = {"vshape": (args.n_agents,)}
     #---------------新增：FPO batch 字段------------------------------
-    if args.runner == "fpo_episode" or args.learner in ("fpo_learner", "fpo_continuous_learner"):
+    if args.runner == "fpo_episode" or args.learner in ("fpo_learner", "fpo_continuous_learner", "fpo_discrete_learner"):
         args.cfm_n_samples = getattr(args, "cfm_n_samples", 1)
         args.cfm_action_dim = getattr(args, "cfm_action_dim", args.n_actions)
         scheme["cfm_eps"] = {
@@ -233,7 +233,7 @@ def run_sequential(args, logger):
 
     logger.console_logger.info("Beginning training for {} timesteps".format(args.t_max))
 
-    is_fpo_transition_batch = args.learner == "fpo_continuous_learner"
+    is_fpo_transition_batch = args.learner in ("fpo_continuous_learner", "fpo_discrete_learner")
     fpo_rollout_timesteps = getattr(args, "fpo_rollout_timesteps", 2048)
     fpo_collected_timesteps = 0
 
@@ -246,7 +246,9 @@ def run_sequential(args, logger):
             # FPO is trained as an on-policy transition batch: keep collecting
             # complete episodes until they contain roughly fpo_rollout_timesteps
             # valid transitions, then train once and clear the episode buffer.
-            fpo_collected_timesteps += int(episode_batch.max_t_filled().item()) - 1
+            fpo_collected_timesteps += int(
+                episode_batch["filled"].sum().item() - episode_batch.batch_size
+            )
             should_train = (
                 fpo_collected_timesteps >= fpo_rollout_timesteps
                 or buffer.episodes_in_buffer >= args.buffer_size

@@ -1,6 +1,7 @@
 import copy
 
 import torch as th
+import torch.nn.functional as F
 from torch.optim import Adam
 
 from components.episode_buffer import EpisodeBatch
@@ -8,14 +9,17 @@ from components.standarize_stream import RunningMeanStd
 from modules.critics import REGISTRY as critic_registry
 
 
-class FPOContinuousLearner:
-    """Continuous FPO learner.
+class FPODiscreteLearner:
+    """离散 FPO learner。
 
-    The rollout policy stores fixed CFM eps/t/action points. During training we
-    recompute the current CFM loss at those same points and use the loss change
-    to build the FPO ratio:
+    与 FPOContinuousLearner 结构对齐：rollout 时存储 CFM eps/t/initial_loss，
+    训练时在相同插值点上重新计算 CFM loss，用 loss 变化量构造 FPO ratio：
 
         rho_s = exp(mean(clamp(L_old - L_new, -rho_clip, rho_clip)))
+
+    CFM 在 n_actions 维 one-hot 空间中操作：
+        x_t = (1-t)*eps + t*one_hot(a)
+        velocity target = one_hot(a) - eps
     """
 
     def __init__(self, mac, scheme, logger, args):
@@ -64,23 +68,15 @@ class FPOContinuousLearner:
         initial_cfm_loss = batch["initial_cfm_loss"][:, :-1]    # [B,T,N,cfm_n,1]
         rho_clip = getattr(self.args, "cfm_rho_clip", 3.0)
 
-        # Minibatches are sampled over environment timesteps. Each selected
-        # timestep keeps all agents together, so 2048 rollout timesteps really
-        # means 2048 environment transitions rather than 2048 agent entries.
         valid_time_indices = th.nonzero(
             mask[:, :, 0].reshape(-1) > 0, as_tuple=False
         ).squeeze(1)
         minibatch_size = getattr(self.args, "fpo_minibatch_size", 256)
         actor_stats = {
-            "advantage_mean": [],
-            "advantage_std": [],
-            "pg_loss": [],
-            "cfm_loss_mean": [],
-            "cfm_reg_loss": [],
-            "rho_s_mean": [],
-            "rho_s_std": [],
-            "clip_fraction": [],
-            "actor_grad_norm": [],
+            "advantage_mean": [], "advantage_std": [],
+            "pg_loss": [], "cfm_loss_mean": [],
+            "rho_s_mean": [], "rho_s_std": [],
+            "clip_fraction": [], "actor_grad_norm": [],
         }
         critic_train_stats = {
             k: [] for k in ["critic_loss", "critic_grad_norm", "td_error_abs",
@@ -88,9 +84,8 @@ class FPOContinuousLearner:
         }
 
         for _ in range(self.args.epochs):
-            # The critic still uses full sequences for n-step returns. We train
-            # it once per epoch, then freeze the advantages for the shuffled
-            # actor minibatches in this epoch.
+            # 每个 epoch 先用完整序列更新一次 critic，得到 advantage；
+            # actor 在同一 epoch 内的 minibatch 中共享这份 advantage。
             advantages, epoch_critic_stats = self.train_critic_sequential(
                 self.critic, self.target_critic, batch, rewards, critic_mask
             )
@@ -98,8 +93,7 @@ class FPOContinuousLearner:
             for key, values in epoch_critic_stats.items():
                 critic_train_stats[key].extend(values)
 
-            # Shuffle valid (episode, time) entries every epoch. This is
-            # the PPO-style minibatch pass over the 2048-step rollout batch.
+            # 每个 epoch 对有效时间步重新打乱，PPO-style minibatch 遍历。
             permutation = valid_time_indices[
                 th.randperm(valid_time_indices.numel(), device=valid_time_indices.device)
             ]
@@ -107,27 +101,32 @@ class FPOContinuousLearner:
             for start in range(0, permutation.numel(), minibatch_size):
                 mb_time_idx = permutation[start:start + minibatch_size]
 
-                # Recompute actor hidden states after every optimizer step. If
-                # we reused one full graph across minibatches, later updates
-                # would backprop through stale pre-step parameters.
+                # 每个 minibatch 都重建隐状态序列，确保 hidden state 与当前参数一致。
                 h_seq = self._build_actor_hidden_sequence(batch)
                 mb_cfm_loss = self._compute_cfm_loss_for_time_indices(
                     batch, h_seq, mb_time_idx
-                )
+                )   # [M, N, cfm_n, 1]  当前参数下的 CFM loss（L_new）
                 mb_initial_cfm_loss = initial_cfm_loss.reshape(
                     -1, self.n_agents, initial_cfm_loss.size(-2), initial_cfm_loss.size(-1)
-                )[mb_time_idx]
+                )[mb_time_idx]   # [M, N, cfm_n, 1]  rollout 时冻结的 CFM loss（L_old）
 
                 advantages_by_time = advantages.reshape(-1, self.n_agents)
-                mb_advantages_2d = advantages_by_time[mb_time_idx]   # [M,N]
+                mb_advantages_2d = advantages_by_time[mb_time_idx]   # [M, N]
 
+                # 对称截断：L_old 和 L_new 使用相同上界。
+                # 若只截 L_new 而不截 L_old，则初期 initial_cfm_loss 可能远大于 5，
+                # 导致 diff 恒为正、rho 恒打满上界（exp(rho_clip)≈20），clip_fraction→1。
                 cfm_loss_clamp = getattr(self.args, "cfm_loss_clamp", 5.0)
                 mb_cfm_loss = mb_cfm_loss.clamp(max=cfm_loss_clamp)
                 mb_initial_cfm_loss = mb_initial_cfm_loss.clamp(max=cfm_loss_clamp)
 
-                diff = mb_initial_cfm_loss - mb_cfm_loss              # [M,N,cfm_n,1]
-                diff_mean = diff.mean(dim=(-2, -1))                   # [M,N]
-                mb_rho_s = th.exp(th.clamp(diff_mean, -rho_clip, rho_clip))  # [M,N]
+                # FPO ratio: rho = exp(clamp(mean(L_old - L_new), ±rho_clip))
+                # 先对 cfm_n 个采样点取均值，再 clamp，避免单点极端值放大方差。
+                # L_old > L_new → rho > 1（当前策略对该动作的"亲和性"提升）
+                # L_old < L_new → rho < 1（当前策略偏离了 rollout 时的动作分布）
+                diff = mb_initial_cfm_loss - mb_cfm_loss              # [M, N, cfm_n, 1]
+                diff_mean = diff.mean(dim=(-2, -1))                   # [M, N]
+                mb_rho_s = th.exp(th.clamp(diff_mean, -rho_clip, rho_clip))  # [M, N]
 
                 mb_rho_s = mb_rho_s.reshape(-1)
                 mb_advantages = mb_advantages_2d.reshape(-1)
@@ -137,13 +136,7 @@ class FPOContinuousLearner:
                 ) * mb_advantages
                 pg_loss = -th.min(surr1, surr2).mean()
 
-                # CFM regularisation: always pull cfm_loss downward so the
-                # velocity net stays trained even when PG gradients are absent
-                # (negative-advantage samples). A small coefficient is enough
-                # because there is no opposing upward force anymore.
-                cfm_reg_coef = getattr(self.args, "cfm_reg_coef", 0.1)
-                cfm_reg_loss = mb_cfm_loss.mean()
-                actor_loss = pg_loss + cfm_reg_coef * cfm_reg_loss
+                actor_loss = pg_loss
 
                 self.actor_optimiser.zero_grad()
                 actor_loss.backward()
@@ -153,28 +146,21 @@ class FPOContinuousLearner:
                 self.actor_optimiser.step()
 
                 actor_stats["advantage_mean"].append(mb_advantages.mean().item())
-                actor_stats["advantage_std"].append(
-                    mb_advantages.std(unbiased=False).item()
-                )
+                actor_stats["advantage_std"].append(mb_advantages.std(unbiased=False).item())
                 actor_stats["pg_loss"].append(pg_loss.item())
-                actor_stats["cfm_loss_mean"].append(
-                    mb_cfm_loss.mean(dim=(-2, -1)).mean().item()
-                )
-                actor_stats["cfm_reg_loss"].append(cfm_reg_loss.item())
+                actor_stats["cfm_loss_mean"].append(mb_cfm_loss.mean(dim=(-2, -1)).mean().item())
                 actor_stats["rho_s_mean"].append(mb_rho_s.mean().item())
                 actor_stats["rho_s_std"].append(mb_rho_s.std(unbiased=False).item())
                 actor_stats["clip_fraction"].append(
-                    (
-                        (mb_rho_s > 1 + self.args.eps_clip)
-                        | (mb_rho_s < 1 - self.args.eps_clip)
-                    ).float().mean().item()
+                    ((mb_rho_s > 1 + self.args.eps_clip) | (mb_rho_s < 1 - self.args.eps_clip))
+                    .float().mean().item()
                 )
                 actor_stats["actor_grad_norm"].append(grad_norm.item())
 
         self.critic_training_steps += 1
         if (
             self.args.target_update_interval_or_tau > 1
-            and (self.critic_training_steps -       self.last_target_update_step)
+            and (self.critic_training_steps - self.last_target_update_step)
             / self.args.target_update_interval_or_tau >= 1.0
         ):
             self._update_targets_hard()
@@ -186,34 +172,16 @@ class FPOContinuousLearner:
             for key in ["critic_loss", "critic_grad_norm", "td_error_abs",
                         "value_mean", "target_mean"]:
                 self.logger.log_stat(key, self._mean_stat(critic_train_stats[key]), t_env)
-            self.logger.log_stat(
-                "advantage_mean", self._mean_stat(actor_stats["advantage_mean"]), t_env
-            )
-            self.logger.log_stat(
-                "advantage_std", self._mean_stat(actor_stats["advantage_std"]), t_env
-            )
+            self.logger.log_stat("advantage_mean", self._mean_stat(actor_stats["advantage_mean"]), t_env)
+            self.logger.log_stat("advantage_std", self._mean_stat(actor_stats["advantage_std"]), t_env)
             self.logger.log_stat("pg_loss", self._mean_stat(actor_stats["pg_loss"]), t_env)
-            self.logger.log_stat(
-                "cfm_loss_mean", self._mean_stat(actor_stats["cfm_loss_mean"]), t_env
-            )
-            self.logger.log_stat(
-                "cfm_reg_loss", self._mean_stat(actor_stats["cfm_reg_loss"]), t_env
-            )
-            self.logger.log_stat(
-                "rho_s_mean", self._mean_stat(actor_stats["rho_s_mean"]), t_env
-            )
-            self.logger.log_stat(
-                "rho_s_std", self._mean_stat(actor_stats["rho_s_std"]), t_env
-            )
-            self.logger.log_stat(
-                "clip_fraction", self._mean_stat(actor_stats["clip_fraction"]), t_env
-            )
-            self.logger.log_stat(
-                "actor_grad_norm", self._mean_stat(actor_stats["actor_grad_norm"]), t_env
-            )
-            self.logger.log_stat(
-                "fpo_valid_transitions", valid_time_indices.numel(), t_env
-            )
+            self.logger.log_stat("cfm_loss_mean", self._mean_stat(actor_stats["cfm_loss_mean"]), t_env)
+
+            self.logger.log_stat("rho_s_mean", self._mean_stat(actor_stats["rho_s_mean"]), t_env)
+            self.logger.log_stat("rho_s_std", self._mean_stat(actor_stats["rho_s_std"]), t_env)
+            self.logger.log_stat("clip_fraction", self._mean_stat(actor_stats["clip_fraction"]), t_env)
+            self.logger.log_stat("actor_grad_norm", self._mean_stat(actor_stats["actor_grad_norm"]), t_env)
+            self.logger.log_stat("fpo_valid_transitions", valid_time_indices.numel(), t_env)
             self.log_stats_t = t_env
 
     def _build_actor_hidden_sequence(self, batch: EpisodeBatch) -> th.Tensor:
@@ -222,76 +190,48 @@ class FPOContinuousLearner:
         for t in range(batch.max_seq_length - 1):
             h = self.mac.forward(batch, t=t)
             h_list.append(h)
-        return th.stack(h_list, dim=1)                # [B,T,N,hidden_dim]
-
-    def _compute_cfm_loss(self, batch: EpisodeBatch, h_seq: th.Tensor) -> th.Tensor:
-        action = batch["actions"][:, :-1].float()     # [B,T,N,n_actions]
-        eps = batch["cfm_eps"][:, :-1]                # [B,T,N,cfm_n,n_actions]
-        cfm_t = batch["cfm_t"][:, :-1]                # [B,T,N,cfm_n,1]
-
-        act_exp = action.unsqueeze(3).expand_as(eps)
-        x_t = (1 - cfm_t) * eps + cfm_t * act_exp
-        h_exp = h_seq.unsqueeze(3).expand(-1, -1, -1, eps.size(3), -1)
-
-        flat_h = h_exp.reshape(-1, h_exp.shape[-1])
-        flat_x_t = x_t.reshape(-1, x_t.shape[-1])
-        flat_t = cfm_t.reshape(-1, 1)
-
-        v_pred = self.mac.agent.velocity(flat_h, flat_x_t, flat_t)
-        v_pred = v_pred.reshape_as(eps)
-
-        cfm_target_type = getattr(self.args, "cfm_target_type", "velocity")
-        if cfm_target_type == "velocity":
-            target = act_exp - eps
-        elif cfm_target_type == "eps":
-            target = eps
-        else:
-            raise ValueError("cfm_target_type must be 'velocity' or 'eps'")
-
-        return ((v_pred - target) ** 2).mean(dim=-1, keepdim=True)
+        return th.stack(h_list, dim=1)                # [B, T, N, hidden_dim]
 
     def _compute_cfm_loss_for_time_indices(
         self, batch: EpisodeBatch, h_seq: th.Tensor, flat_time_indices: th.Tensor
     ) -> th.Tensor:
-        # Minibatches are sampled over flattened (episode, time) entries. We
-        # keep the full agent dimension for each timestep and evaluate all CFM
-        # samples attached to those agents.
-        action = batch["actions"][:, :-1].float().reshape(
-            -1, self.n_agents, self.n_actions
-        )
+        # 从 buffer 中取出 rollout 时存储的离散动作、噪声和插值时间。
+        actions = batch["actions"][:, :-1].reshape(
+            -1, self.n_agents, 1
+        )   # [B*T, N, 1] long
         eps = batch["cfm_eps"][:, :-1].reshape(
             -1, self.n_agents, self.args.cfm_n_samples, self.args.cfm_action_dim
-        )
+        )   # [B*T, N, cfm_n, A]
         cfm_t = batch["cfm_t"][:, :-1].reshape(
             -1, self.n_agents, self.args.cfm_n_samples, 1
-        )
+        )   # [B*T, N, cfm_n, 1]
         h = h_seq.reshape(-1, self.n_agents, h_seq.shape[-1])
 
-        mb_action = action[flat_time_indices]         # [M,N,A]
-        mb_eps = eps[flat_time_indices]               # [M,N,cfm_n,A]
-        mb_cfm_t = cfm_t[flat_time_indices]           # [M,N,cfm_n,1]
-        mb_h = h[flat_time_indices]                   # [M,N,H]
+        mb_action = actions[flat_time_indices]        # [M, N, 1]
+        mb_eps    = eps[flat_time_indices]            # [M, N, cfm_n, A]
+        mb_cfm_t  = cfm_t[flat_time_indices]          # [M, N, cfm_n, 1]
+        mb_h      = h[flat_time_indices]              # [M, N, H]
 
-        act_exp = mb_action.unsqueeze(2).expand_as(mb_eps)
-        x_t = (1 - mb_cfm_t) * mb_eps + mb_cfm_t * act_exp
+        # 离散动作 → one-hot，作为 CFM 的 x_1（数据端）。
+        one_hot_a = F.one_hot(
+            mb_action.squeeze(-1), self.n_actions
+        ).float()                                               # [M, N, A]
+        act_exp = one_hot_a.unsqueeze(2).expand_as(mb_eps)     # [M, N, cfm_n, A]
+
+        # 标准 Flow Matching 插值：x_t = (1-t)*eps + t*one_hot(a)
+        x_t   = (1 - mb_cfm_t) * mb_eps + mb_cfm_t * act_exp
         h_exp = mb_h.unsqueeze(2).expand(-1, -1, mb_eps.size(2), -1)
 
-        flat_h = h_exp.reshape(-1, h_exp.shape[-1])
+        flat_h   = h_exp.reshape(-1, h_exp.shape[-1])
         flat_x_t = x_t.reshape(-1, x_t.shape[-1])
-        flat_t = mb_cfm_t.reshape(-1, 1)
+        flat_t   = mb_cfm_t.reshape(-1, 1)
 
         v_pred = self.mac.agent.velocity(flat_h, flat_x_t, flat_t)
         v_pred = v_pred.reshape_as(mb_eps)
 
-        cfm_target_type = getattr(self.args, "cfm_target_type", "velocity")
-        if cfm_target_type == "velocity":
-            target = act_exp - mb_eps
-        elif cfm_target_type == "eps":
-            target = mb_eps
-        else:
-            raise ValueError("cfm_target_type must be 'velocity' or 'eps'")
+        target = act_exp - mb_eps    # velocity target: dx_t/dt = one_hot(a) - eps
 
-        return ((v_pred - target) ** 2).mean(dim=-1, keepdim=True)
+        return ((v_pred - target) ** 2).mean(dim=-1, keepdim=True)  # [M, N, cfm_n, 1]
 
     def train_critic_sequential(self, critic, target_critic, batch, rewards, mask):
         with th.no_grad():

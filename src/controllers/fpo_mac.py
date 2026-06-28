@@ -36,10 +36,10 @@ class FPOMAC:
             # 测试时直接用均值（无随机性）
             action = th.clamp(
                 self._last_eps.view(B, self.n_agents, -1)
-                - self.agent.velocity(
+                + self.agent.velocity(
                     self.hidden_states.view(B * self.n_agents, -1),
                     self._last_eps,
-                    th.ones(B * self.n_agents, 1, device=action.device),
+                    th.zeros(B * self.n_agents, 1, device=action.device),
                 ).view(B, self.n_agents, -1),
                 0.0, 1.0,
             )
@@ -54,7 +54,9 @@ class FPOMAC:
 
     # ── rollout 时计算 initial_cfm_loss ──────────────────────────────────────
 
-    def compute_initial_cfm_loss(self, cfm_eps, cfm_t, actions):
+    def compute_initial_cfm_loss(
+        self, cfm_eps, cfm_t, actions, bs=slice(None)
+    ):
         """用当前 hidden state 和流网络计算 rollout 时的 CFM loss。
 
         cfm_eps:  [B, N, cfm_n, n_actions]
@@ -64,15 +66,20 @@ class FPOMAC:
         返回: initial_cfm_loss [B, N, cfm_n, 1]，存入 buffer，训练时当参考基线。
         """
         with th.no_grad():
-            h = self.hidden_states                              # [B*N, hidden_dim]
+            full_batch_size = self.hidden_states.shape[0]
+            if self.hidden_states.dim() == 2:
+                full_batch_size //= self.n_agents
+            h = self.hidden_states.reshape(
+                full_batch_size, self.n_agents, -1
+            )[bs]
             B, N = cfm_eps.shape[0], cfm_eps.shape[1]
             cfm_n = cfm_eps.shape[2]
 
             # 扩维与 cfm_n 对齐
             act_exp = actions.unsqueeze(2).expand_as(cfm_eps)         # [B,N,cfm_n,n_act]
-            x_t = cfm_t * cfm_eps + (1 - cfm_t) * act_exp            # 插值点
+            x_t = (1 - cfm_t) * cfm_eps + cfm_t * act_exp            # 插值点
 
-            h_exp = h.view(B, N, 1, -1).expand(-1, -1, cfm_n, -1)    # [B,N,cfm_n,hidden]
+            h_exp = h.reshape(B, N, 1, -1).expand(-1, -1, cfm_n, -1)
 
             flat_h    = h_exp.reshape(-1, h_exp.shape[-1])
             flat_x_t  = x_t.reshape(-1, x_t.shape[-1])
@@ -81,7 +88,7 @@ class FPOMAC:
             v_pred = self.agent.velocity(flat_h, flat_x_t, flat_t)
             v_pred = v_pred.reshape(B, N, cfm_n, -1)
 
-            target = cfm_eps - act_exp                                 # velocity target
+            target = act_exp - cfm_eps                                 # velocity target
             cfm_loss = ((v_pred - target) ** 2).mean(dim=-1, keepdim=True)  # [B,N,cfm_n,1]
         return cfm_loss
 
