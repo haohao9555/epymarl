@@ -72,11 +72,13 @@ class FPODiscreteLearner:
             mask[:, :, 0].reshape(-1) > 0, as_tuple=False
         ).squeeze(1)
         minibatch_size = getattr(self.args, "fpo_minibatch_size", 256)
+        entropy_coef = getattr(self.args, 'entropy_coef', 0.0)
         actor_stats = {
             "advantage_mean": [], "advantage_std": [],
             "pg_loss": [], "cfm_loss_mean": [],
             "rho_s_mean": [], "rho_s_std": [],
             "clip_fraction": [], "actor_grad_norm": [],
+            "entropy_mean": [],
         }
         critic_train_stats = {
             k: [] for k in ["critic_loss", "critic_grad_norm", "td_error_abs",
@@ -103,6 +105,7 @@ class FPODiscreteLearner:
 
                 # 每个 minibatch 都重建隐状态序列，确保 hidden state 与当前参数一致。
                 h_seq = self._build_actor_hidden_sequence(batch)
+                mb_h = h_seq.reshape(-1, self.n_agents, h_seq.shape[-1])[mb_time_idx]  # [M, N, H]
                 mb_cfm_loss = self._compute_cfm_loss_for_time_indices(
                     batch, h_seq, mb_time_idx
                 )   # [M, N, cfm_n, 1]  当前参数下的 CFM loss（L_new）
@@ -136,7 +139,23 @@ class FPODiscreteLearner:
                 ) * mb_advantages
                 pg_loss = -th.min(surr1, surr2).mean()
 
-                actor_loss = pg_loss
+                # Entropy bonus: softmax over flow logits = eps + v(h, eps, t=0)
+                # encourages action diversity, prevents collapse to no-op
+                if entropy_coef > 0.0:
+                    M, N, H = mb_h.shape
+                    ent_eps = th.randn(M, N, self.n_actions, device=mb_h.device)
+                    ent_t = th.zeros(M, N, 1, device=mb_h.device)
+                    logits = ent_eps.reshape(M * N, -1) + self.mac.agent.velocity(
+                        mb_h.reshape(M * N, H),
+                        ent_eps.reshape(M * N, self.n_actions),
+                        ent_t.reshape(M * N, 1),
+                    )
+                    log_p = F.log_softmax(logits, dim=-1)
+                    entropy = -(log_p.exp() * log_p).sum(-1).mean()
+                else:
+                    entropy = th.tensor(0.0)
+
+                actor_loss = pg_loss - entropy_coef * entropy
 
                 self.actor_optimiser.zero_grad()
                 actor_loss.backward()
@@ -156,6 +175,7 @@ class FPODiscreteLearner:
                     .float().mean().item()
                 )
                 actor_stats["actor_grad_norm"].append(grad_norm.item())
+                actor_stats["entropy_mean"].append(entropy.item())
 
         self.critic_training_steps += 1
         if (
@@ -181,6 +201,7 @@ class FPODiscreteLearner:
             self.logger.log_stat("rho_s_std", self._mean_stat(actor_stats["rho_s_std"]), t_env)
             self.logger.log_stat("clip_fraction", self._mean_stat(actor_stats["clip_fraction"]), t_env)
             self.logger.log_stat("actor_grad_norm", self._mean_stat(actor_stats["actor_grad_norm"]), t_env)
+            self.logger.log_stat("entropy_mean", self._mean_stat(actor_stats["entropy_mean"]), t_env)
             self.logger.log_stat("fpo_valid_transitions", valid_time_indices.numel(), t_env)
             self.log_stats_t = t_env
 
