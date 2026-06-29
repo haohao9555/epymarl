@@ -1,4 +1,5 @@
 from functools import partial
+import os
 
 import numpy as np
 
@@ -65,7 +66,7 @@ class EpisodeRunner:
         self.env.reset()
         self.t = 0
 
-    def run(self, test_mode=False):
+    def run(self, test_mode=False, record_path=None):
         self.reset()
 
         terminated = False
@@ -74,6 +75,8 @@ class EpisodeRunner:
         else:
             episode_return = np.zeros(self.args.n_agents)
         self.mac.init_hidden(batch_size=self.batch_size)
+        record_frames = []
+        self._capture_record_frame(record_frames, record_path)
 
         while not terminated:
             pre_transition_data = {
@@ -94,6 +97,7 @@ class EpisodeRunner:
             terminated = terminated or truncated
             if test_mode and self.args.render:
                 self.env.render()
+            self._capture_record_frame(record_frames, record_path)
             episode_return += reward
 
             post_transition_data = {
@@ -151,7 +155,28 @@ class EpisodeRunner:
                 )
             self.log_train_stats_t = self.t_env
 
+        self._save_recording(record_frames, record_path)
         return self.batch
+
+    def _capture_record_frame(self, frames, record_path):
+        if record_path is None:
+            return
+        try:
+            frame = self.env.render(mode="rgb_array")
+        except TypeError:
+            frame = self.env.render()
+        if frame is not None:
+            frames.append(frame)
+
+    def _save_recording(self, frames, record_path):
+        if record_path is None or len(frames) == 0:
+            return
+        try:
+            import imageio.v2 as imageio
+            os.makedirs(os.path.dirname(record_path), exist_ok=True)
+            imageio.mimsave(record_path, frames, fps=getattr(self.args, "record_mov_fps", 10))
+        except Exception as exc:
+            self.logger.console_logger.warning("Failed to save recording %s: %s", record_path, exc)
 
     def _log(self, returns, stats, prefix):
         if self.args.common_reward:

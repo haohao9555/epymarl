@@ -1,3 +1,4 @@
+seed: 42
 # --- Discrete MAFPO parameters (CFM-based rho, one-hot action space) ---
 
 runner: "parallel"
@@ -45,4 +46,7 @@ wandb_project: "epymarl-mpe"
 wandb_run_name: "MAFPO-MPE-Discrete"
 wandb_mode: "online"
 
-t_max: 20050000
+t_max: 2000000
+record_mov: True
+record_mov_timesteps: [50000, 500000, 1000000, 2000000]
+record_mov_fps: 5

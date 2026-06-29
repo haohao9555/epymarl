@@ -1,9 +1,11 @@
+seed: 42
 # --- MAPPO specific parameters ---
 
 action_selector: "soft_policies"
 mask_before_softmax: True
 
 runner: "parallel"
+common_reward: False
 
 buffer_size: 10
 batch_size_run: 10
@@ -31,4 +33,14 @@ epochs: 4
 eps_clip: 0.2
 name: "mappo"
 
-t_max: 20050000
+t_max: 2000000
+
+use_wandb: True
+wandb_team: "adolf9555-university-of-technology-sydney"
+wandb_project: "epymarl-mpe-clamp-ablation"
+wandb_run_name: "MAPPO-seed42-baseline"
+wandb_mode: "online"
+
+record_mov: True
+record_mov_timesteps: [50000, 500000, 1000000, 2000000]
+record_mov_fps: 5

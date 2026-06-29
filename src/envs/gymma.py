@@ -41,6 +41,8 @@ class GymmaWrapper(MultiAgentEnv):
         reward_scalarisation,
         **kwargs,
     ):
+        if kwargs.pop("record_rgb_array", False):
+            kwargs.setdefault("render_mode", "rgb_array")
         self._env = gym.make(f"{key}", **kwargs)
         self._env = TimeLimit(self._env, max_episode_steps=time_limit)
         self._env = FlattenObservation(self._env)
@@ -168,7 +170,7 @@ class GymmaWrapper(MultiAgentEnv):
         return self._obs, info
 
     def render(self):
-        self._env.render()
+        return self._env.render()
 
     def close(self):
         self._env.close()

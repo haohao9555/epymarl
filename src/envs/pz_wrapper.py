@@ -34,8 +34,8 @@ class PettingZooWrapper(gym.Env):
         self.last_obs = obs
         return obs, info
 
-    def render(self, mode="human"):
-        return self._env.render(mode)
+    def render(self):
+        return self._env.render()
 
     def step(self, actions):
         dict_actions = {}

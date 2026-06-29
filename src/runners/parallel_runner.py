@@ -1,4 +1,5 @@
 from functools import partial
+import os
 from multiprocessing import Pipe, Process
 
 import numpy as np
@@ -128,7 +129,7 @@ class ParallelRunner:
         self.t = 0
         self.env_steps_this_run = 0
 
-    def run(self, test_mode=False):
+    def run(self, test_mode=False, record_path=None):
         self.reset()
 
         all_terminated = False
@@ -140,6 +141,8 @@ class ParallelRunner:
             ]
         episode_lengths = [0 for _ in range(self.batch_size)]
         self.mac.init_hidden(batch_size=self.batch_size)
+        record_frames = []
+        self._capture_record_frame(record_frames, record_path)
         terminated = [False for _ in range(self.batch_size)]
         envs_not_terminated = [
             b_idx for b_idx, termed in enumerate(terminated) if not termed
@@ -231,6 +234,8 @@ class ParallelRunner:
                     pre_transition_data["avail_actions"].append(data["avail_actions"])
                     pre_transition_data["obs"].append(data["obs"])
 
+            self._capture_record_frame(record_frames, record_path)
+
             # Add post_transiton data into the batch
             self.batch.update(
                 post_transition_data,
@@ -289,7 +294,26 @@ class ParallelRunner:
                 )
             self.log_train_stats_t = self.t_env
 
+        self._save_recording(record_frames, record_path)
         return self.batch
+
+    def _capture_record_frame(self, frames, record_path):
+        if record_path is None:
+            return
+        self.parent_conns[0].send(("render_rgb_array", None))
+        frame = self.parent_conns[0].recv()
+        if frame is not None:
+            frames.append(frame)
+
+    def _save_recording(self, frames, record_path):
+        if record_path is None or len(frames) == 0:
+            return
+        try:
+            import imageio.v2 as imageio
+            os.makedirs(os.path.dirname(record_path), exist_ok=True)
+            imageio.mimsave(record_path, frames, fps=getattr(self.args, "record_mov_fps", 10))
+        except Exception as exc:
+            self.logger.console_logger.warning("Failed to save recording %s: %s", record_path, exc)
 
     def _log(self, returns, stats, prefix):
         if self.args.common_reward:
@@ -369,6 +393,18 @@ def env_worker(remote, env_fn):
             remote.send(env.get_stats())
         elif cmd == "render":
             env.render()
+        elif cmd == "render_rgb_array":
+            # Must run on this thread — pygame is not thread-safe.
+            try:
+                frame = env.render(mode="rgb_array")
+            except TypeError:
+                try:
+                    frame = env.render()
+                except Exception:
+                    frame = None
+            except Exception:
+                frame = None
+            remote.send(frame)
         elif cmd == "save_replay":
             env.save_replay()
         else:

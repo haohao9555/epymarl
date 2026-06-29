@@ -164,19 +164,20 @@ class PPOLearner:
             )
             self.logger.log_stat("advantage_std", advantage_std.item(), t_env)
             self.logger.log_stat("pg_loss", pg_loss.item(), t_env)
-            self.logger.log_stat("agent_grad_norm", grad_norm.item(), t_env)
-            self.logger.log_stat("entropy_mean", entropy_mean.item(), t_env)
-            self.logger.log_stat("approx_kl", approx_kl.item(), t_env)
+            self.logger.log_stat("actor_grad_norm", grad_norm.item(), t_env)
             self.logger.log_stat("clip_fraction", clip_fraction.item(), t_env)
-            self.logger.log_stat("ratio_mean", ratio_mean.item(), t_env)
-            self.logger.log_stat("ratio_std", ratio_std.item(), t_env)
-            self.logger.log_stat("pi_taken_mean", pi_taken_mean.item(), t_env)
-            self.logger.log_stat("old_pi_taken_mean", old_pi_taken_mean.item(), t_env)
-            self.logger.log_stat(
-                "pi_max",
-                (pi.max(dim=-1)[0] * mask).sum().item() / mask.sum().item(),
-                t_env,
-            )
+            # MAPPO-only metrics commented out to align with MAFPO logging
+            # self.logger.log_stat("entropy_mean", entropy_mean.item(), t_env)
+            # self.logger.log_stat("approx_kl", approx_kl.item(), t_env)
+            # self.logger.log_stat("ratio_mean", ratio_mean.item(), t_env)
+            # self.logger.log_stat("ratio_std", ratio_std.item(), t_env)
+            # self.logger.log_stat("pi_taken_mean", pi_taken_mean.item(), t_env)
+            # self.logger.log_stat("old_pi_taken_mean", old_pi_taken_mean.item(), t_env)
+            # self.logger.log_stat(
+            #     "pi_max",
+            #     (pi.max(dim=-1)[0] * mask).sum().item() / mask.sum().item(),
+            #     t_env,
+            # )
             self.log_stats_t = t_env
 
     def train_critic_sequential(self, critic, target_critic, batch, rewards, mask):

@@ -95,7 +95,62 @@ def evaluate_sequential(args, runner):
     runner.close_env()
 
 
+def _record_mov_available(args, logger):
+    if not getattr(args, "record_mov", False):
+        return False
+    try:
+        import imageio.v2 as imageio
+        import numpy as np
+        test_dir = os.path.join(args.local_results_path, "videos", "_preflight")
+        os.makedirs(test_dir, exist_ok=True)
+        test_path = os.path.join(test_dir, "record_mov_preflight.mov")
+        frame = np.zeros((8, 8, 3), dtype=np.uint8)
+        imageio.mimsave(test_path, [frame, frame], fps=getattr(args, "record_mov_fps", 10))
+        try:
+            os.remove(test_path)
+        except OSError:
+            pass
+        logger.console_logger.info(".mov recording preflight passed")
+        return True
+    except Exception as exc:
+        logger.console_logger.warning(".mov recording is disabled; preflight failed: %s", exc)
+        return False
+
+
+def _safe_filename_part(value):
+    return "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in str(value))
+
+
+def _format_timestep(step):
+    if step % 1000000 == 0:
+        return f"{step // 1000000}M"
+    if step % 1000 == 0:
+        return f"{step // 1000}K"
+    return str(step)
+
+
+def _next_record_path(args, timestep):
+    clamp = getattr(args, "cfm_loss_clamp", "na")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = "{}_seed{}_clamp{}_t{}_{}.mov".format(
+        _safe_filename_part(args.name),
+        _safe_filename_part(args.seed),
+        _safe_filename_part(clamp),
+        _format_timestep(int(timestep)),
+        timestamp,
+    )
+    record_dir = os.path.join(args.local_results_path, "videos", _safe_filename_part(args.unique_token))
+    path = os.path.join(record_dir, filename)
+    base, ext = os.path.splitext(path)
+    suffix = 1
+    while os.path.exists(path):
+        path = f"{base}_{suffix:03d}{ext}"
+        suffix += 1
+    return path
 def run_sequential(args, logger):
+    if getattr(args, "record_mov", False) and getattr(args, "env", None) == "gymma":
+        args.env_args["record_rgb_array"] = True
+
     # Init runner so we can get env info
     runner = r_REGISTRY[args.runner](args=args, logger=logger)
 
@@ -232,6 +287,9 @@ def run_sequential(args, logger):
     last_time = start_time
 
     logger.console_logger.info("Beginning training for {} timesteps".format(args.t_max))
+    record_mov_enabled = _record_mov_available(args, logger)
+    record_mov_steps = sorted(int(t) for t in getattr(args, "record_mov_timesteps", []))
+    recorded_mov_steps = set()
 
     is_fpo_transition_batch = args.learner in ("fpo_continuous_learner", "fpo_discrete_learner")
     fpo_rollout_timesteps = getattr(args, "fpo_rollout_timesteps", 2048)
@@ -278,6 +336,21 @@ def run_sequential(args, logger):
                 buffer.buffer_index = 0
                 buffer.episodes_in_buffer = 0
                 fpo_collected_timesteps = 0
+
+        if record_mov_enabled:
+            due_steps = [
+                step for step in record_mov_steps
+                if step <= runner.t_env and step not in recorded_mov_steps
+            ]
+            for record_step in due_steps:
+                record_path = _next_record_path(args, record_step)
+                logger.console_logger.info(
+                    "Recording evaluation episode at %s steps to %s",
+                    record_step,
+                    record_path,
+                )
+                runner.run(test_mode=True, record_path=record_path)
+                recorded_mov_steps.add(record_step)
 
         # Execute test runs once in a while
         n_test_runs = max(1, args.test_nepisode // runner.batch_size)
