@@ -11,9 +11,15 @@ class FPODiscreteAgent(nn.Module):
         x_t = (1-t)*eps + t*one_hot(a)
         velocity target = one_hot(a) - eps
 
-    rollout 采样（一步 Euler，从 t=0 积分到 t=1）：
-        logits = eps + v(h, eps, t=0)
-        a = argmax(logits)
+    rollout 采样（K 步 Euler，从 t=0 积分到 t=1，K = args.cfm_rollout_steps）：
+        x_{t+dt} = x_t + dt * v(h, x_t, t)
+        a = argmax(x_1)
+
+    注：一步 Euler 仅在给定 h 时目标动作分布退化为单点质量（确定性策略）时才
+    是精确解——此时最优 v(h, x_0, 0) = E[x_1|h] - x_0，噪声被精确抵消。当策略
+    仍有熵（探索阶段）时，边际速度场在 t→1 时才逐渐依赖 x_t 收窄向具体模态，
+    单步会把不同 eps 的输出都拉向同一个"平均方向"，丧失探索多样性。多步积分
+    让网络在中间 t 重新评估 x_t，更贴近标准 flow matching 的采样过程。
     """
 
     def __init__(self, input_shape, args):
@@ -56,13 +62,29 @@ class FPODiscreteAgent(nn.Module):
         """
         return self.vel_fc2(F.relu(self.vel_fc1(th.cat([h, x_t, t], dim=-1))))
 
+    def integrate(self, h, eps, n_steps):
+        """K 步 Euler 积分，从 x_0=eps（t=0）走到 x_1（t=1）。
+
+        h:       [..., hidden_dim]
+        eps:     [..., n_actions]  x_0
+        n_steps: int，积分步数（K=1 退化为原来的一步 Euler）
+
+        返回 logits（x_1 估计）: [..., n_actions]
+        """
+        x = eps
+        dt = 1.0 / n_steps
+        for i in range(n_steps):
+            t = x.new_full(x.shape[:-1] + (1,), i * dt)
+            x = x + dt * self.velocity(h, x, t)
+        return x
+
     def forward(self, inputs, hidden_state):
         """返回 (h, h)，h 供 learner 计算 CFM loss。"""
         h = self.encode(inputs, hidden_state)
         return h, h
 
     def sample_action(self, inputs, hidden_state):
-        """一步 flow 采样，返回 (action, h, eps)。
+        """K 步 flow 采样，返回 (action, h, eps)。
 
         action: [..., 1]  long integer（环境接收的离散动作）
         h:      [..., hidden_dim]
@@ -71,7 +93,7 @@ class FPODiscreteAgent(nn.Module):
         h = self.encode(inputs, hidden_state)
         n_act = self.args.n_actions
         eps = th.randn(*h.shape[:-1], n_act, device=h.device)
-        t = th.zeros(*h.shape[:-1], 1, device=h.device)
-        logits = eps + self.velocity(h, eps, t)
+        n_steps = getattr(self.args, "cfm_rollout_steps", 1)
+        logits = self.integrate(h, eps, n_steps)
         action = logits.argmax(dim=-1, keepdim=True)
         return action, h, eps

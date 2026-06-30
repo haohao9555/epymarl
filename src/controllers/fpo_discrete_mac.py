@@ -7,7 +7,7 @@ from modules.agents import REGISTRY as agent_REGISTRY
 class FPODiscreteMAC:
     """离散 FPO 多智能体控制器。
 
-    - select_actions(): 调用 agent.sample_action()，一步 flow → argmax 得离散动作
+    - select_actions(): 调用 agent.sample_action()，K 步 Euler flow → argmax 得离散动作
     - forward():        返回 h（hidden state），供 learner 计算 CFM loss
     - compute_initial_cfm_loss(): rollout 时用当前策略计算 CFM loss（以 one-hot 为目标）
     """

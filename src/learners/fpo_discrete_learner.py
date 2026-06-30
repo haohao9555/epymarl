@@ -139,16 +139,19 @@ class FPODiscreteLearner:
                 ) * mb_advantages
                 pg_loss = -th.min(surr1, surr2).mean()
 
-                # Entropy bonus: softmax over flow logits = eps + v(h, eps, t=0)
-                # encourages action diversity, prevents collapse to no-op
+                # Entropy bonus: softmax over flow logits = K-step Euler integration
+                # of the same ODE used at rollout (sample_action). Using the same
+                # integration depth keeps this entropy estimate consistent with the
+                # actual action-sampling distribution; encourages action diversity,
+                # prevents collapse to no-op.
                 if entropy_coef > 0.0:
                     M, N, H = mb_h.shape
                     ent_eps = th.randn(M, N, self.n_actions, device=mb_h.device)
-                    ent_t = th.zeros(M, N, 1, device=mb_h.device)
-                    logits = ent_eps.reshape(M * N, -1) + self.mac.agent.velocity(
+                    n_steps = getattr(self.args, "cfm_rollout_steps", 1)
+                    logits = self.mac.agent.integrate(
                         mb_h.reshape(M * N, H),
                         ent_eps.reshape(M * N, self.n_actions),
-                        ent_t.reshape(M * N, 1),
+                        n_steps,
                     )
                     log_p = F.log_softmax(logits, dim=-1)
                     entropy = -(log_p.exp() * log_p).sum(-1).mean()
