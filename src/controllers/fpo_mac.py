@@ -10,7 +10,7 @@ class FPOMAC:
     """FPO 多智能体控制器。
 
     与 ContinuousMAC 的区别:
-      - select_actions(): 调用 agent.sample_action()，通过一步 flow 产生动作
+      - select_actions(): 调用 agent.sample_action()，通过 K 步 Euler flow 产生动作
       - forward():        返回 h（hidden state），供 learner 计算 CFM loss
       - compute_initial_cfm_loss(): 在 rollout 时用当前策略计算初始 CFM loss
     """
@@ -26,23 +26,27 @@ class FPOMAC:
 
     def select_actions(self, ep_batch, t_ep, t_env, bs=slice(None), test_mode=False):
         inputs = self._build_inputs(ep_batch, t_ep)
-        action, self.hidden_states, self._last_eps = self.agent.sample_action(
-            inputs, self.hidden_states
-        )
-        # action: [B*N, n_actions] → [B, N, n_actions]
         B = ep_batch.batch_size
-        action = action.view(B, self.n_agents, -1)
+
         if test_mode:
-            # 测试时直接用均值（无随机性）
-            action = th.clamp(
-                self._last_eps.view(B, self.n_agents, -1)
-                + self.agent.velocity(
-                    self.hidden_states.view(B * self.n_agents, -1),
-                    self._last_eps,
-                    th.zeros(B * self.n_agents, 1, device=action.device),
-                ).view(B, self.n_agents, -1),
-                0.0, 1.0,
+            # 确定性评估：用 eps=0（N(0,I) 的众数）而不是重新随机采样，
+            # 与 BetaActionSelector 在 test_mode 下返回分布均值而非 sample() 的约定一致
+            # （见 components/action_selectors.py 的 BetaActionSelector）。
+            h = self.agent.encode(inputs, self.hidden_states)
+            self.hidden_states = h
+            n_act = self.args.n_actions
+            eps = th.zeros(*h.shape[:-1], n_act, device=h.device)
+            n_steps = getattr(self.args, "cfm_rollout_steps", 1)
+            x1 = self.agent.integrate(h, eps, n_steps)
+            action = th.clamp(x1, 0.0, 1.0)
+            self._last_eps = eps
+        else:
+            action, self.hidden_states, self._last_eps = self.agent.sample_action(
+                inputs, self.hidden_states
             )
+
+        # action: [B*N, n_actions] → [B, N, n_actions]
+        action = action.view(B, self.n_agents, -1)
         return action[bs]
 
     # ── learner forward（返回 h 供 CFM loss 计算）────────────────────────────

@@ -13,8 +13,11 @@ class FPOActor(nn.Module):
         obs → fc1 → ReLU → GRU → h
         [h, x_t, t] → vel_fc1 → ReLU → vel_fc2 → velocity
 
-    rollout 采样: action = clamp(eps - v(h, eps, t=1), 0, 1)
-    训练 CFM   : cfm_loss = ||v(h, x_t, t) - (eps - action)||²
+    rollout 采样（K 步 Euler，从 t=0 积分到 t=1，K = args.cfm_rollout_steps）：
+        x_0 = eps ~ N(0,I)
+        x_{t+dt} = x_t + dt * v(h, x_t, t)
+        action = clamp(x_1, 0, 1)
+    训练 CFM   : cfm_loss = ||v(h, x_t, t) - (action - eps)||²
     """
 
     def __init__(self, input_shape, args):
@@ -68,13 +71,31 @@ class FPOActor(nn.Module):
         h = self.encode(inputs, hidden_state)
         return h, h
 
-    # ── rollout 动作采样（一步 flow）────────────────────────────────────────
+    # ── K 步 Euler 积分（t=0 → t=1）───────────────────────────────────────────
+
+    def integrate(self, h, eps, n_steps):
+        """K 步 Euler 积分，从 x_0=eps（t=0）走到 x_1（t=1）。
+
+        h:       [..., hidden_dim]
+        eps:     [..., n_actions]  x_0
+        n_steps: int，积分步数（K=1 退化为原来的一步 Euler）
+
+        返回 x_1 估计（未裁剪到 [0,1]）: [..., n_actions]
+        """
+        x = eps
+        dt = 1.0 / n_steps
+        for i in range(n_steps):
+            t = x.new_full(x.shape[:-1] + (1,), i * dt)
+            x = x + dt * self.velocity(h, x, t)
+        return x
+
+    # ── rollout 动作采样（K 步 flow）────────────────────────────────────────
 
     def sample_action(self, inputs, hidden_state):
-        """One-step flow 采样。
+        """K 步 flow 采样。
 
-        x_1 = eps ~ N(0,I)
-        action = clamp(eps - v(h, eps, t=1), 0, 1)
+        x_0 = eps ~ N(0,I)
+        action = clamp(integrate(h, eps, K), 0, 1)
 
         返回: (action, h, eps)
             action: [..., n_actions]  实际执行的动作
@@ -84,9 +105,9 @@ class FPOActor(nn.Module):
         h = self.encode(inputs, hidden_state)
         n_act = self.args.n_actions
         eps = th.randn(*h.shape[:-1], n_act, device=h.device)
-        t = th.ones(*h.shape[:-1], 1, device=h.device)
-        v = self.velocity(h, eps, t)
-        action = th.clamp(eps - v, 0.0, 1.0)
+        n_steps = getattr(self.args, "cfm_rollout_steps", 1)
+        x1 = self.integrate(h, eps, n_steps)
+        action = th.clamp(x1, 0.0, 1.0)
         return action, h, eps
 
 #-----------------------------

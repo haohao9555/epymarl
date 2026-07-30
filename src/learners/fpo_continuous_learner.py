@@ -76,7 +76,6 @@ class FPOContinuousLearner:
             "advantage_std": [],
             "pg_loss": [],
             "cfm_loss_mean": [],
-            "cfm_reg_loss": [],
             "rho_s_mean": [],
             "rho_s_std": [],
             "clip_fraction": [],
@@ -88,9 +87,9 @@ class FPOContinuousLearner:
         }
 
         for _ in range(self.args.epochs):
-            # The critic still uses full sequences for n-step returns. We train
-            # it once per epoch, then freeze the advantages for the shuffled
-            # actor minibatches in this epoch.
+            # The critic still uses full sequences for GAE. We train it once
+            # per epoch, then freeze the advantages for the shuffled actor
+            # minibatches in this epoch.
             advantages, epoch_critic_stats = self.train_critic_sequential(
                 self.critic, self.target_critic, batch, rewards, critic_mask
             )
@@ -121,10 +120,6 @@ class FPOContinuousLearner:
                 advantages_by_time = advantages.reshape(-1, self.n_agents)
                 mb_advantages_2d = advantages_by_time[mb_time_idx]   # [M,N]
 
-                cfm_loss_clamp = getattr(self.args, "cfm_loss_clamp", 5.0)
-                mb_cfm_loss = mb_cfm_loss.clamp(max=cfm_loss_clamp)
-                mb_initial_cfm_loss = mb_initial_cfm_loss.clamp(max=cfm_loss_clamp)
-
                 diff = mb_initial_cfm_loss - mb_cfm_loss              # [M,N,cfm_n,1]
                 diff_mean = diff.mean(dim=(-2, -1))                   # [M,N]
                 mb_rho_s = th.exp(th.clamp(diff_mean, -rho_clip, rho_clip))  # [M,N]
@@ -136,14 +131,7 @@ class FPOContinuousLearner:
                     mb_rho_s, 1 - self.args.eps_clip, 1 + self.args.eps_clip
                 ) * mb_advantages
                 pg_loss = -th.min(surr1, surr2).mean()
-
-                # CFM regularisation: always pull cfm_loss downward so the
-                # velocity net stays trained even when PG gradients are absent
-                # (negative-advantage samples). A small coefficient is enough
-                # because there is no opposing upward force anymore.
-                cfm_reg_coef = getattr(self.args, "cfm_reg_coef", 0.1)
-                cfm_reg_loss = mb_cfm_loss.mean()
-                actor_loss = pg_loss + cfm_reg_coef * cfm_reg_loss
+                actor_loss = pg_loss
 
                 self.actor_optimiser.zero_grad()
                 actor_loss.backward()
@@ -160,7 +148,6 @@ class FPOContinuousLearner:
                 actor_stats["cfm_loss_mean"].append(
                     mb_cfm_loss.mean(dim=(-2, -1)).mean().item()
                 )
-                actor_stats["cfm_reg_loss"].append(cfm_reg_loss.item())
                 actor_stats["rho_s_mean"].append(mb_rho_s.mean().item())
                 actor_stats["rho_s_std"].append(mb_rho_s.std(unbiased=False).item())
                 actor_stats["clip_fraction"].append(
@@ -195,9 +182,6 @@ class FPOContinuousLearner:
             self.logger.log_stat("pg_loss", self._mean_stat(actor_stats["pg_loss"]), t_env)
             self.logger.log_stat(
                 "cfm_loss_mean", self._mean_stat(actor_stats["cfm_loss_mean"]), t_env
-            )
-            self.logger.log_stat(
-                "cfm_reg_loss", self._mean_stat(actor_stats["cfm_reg_loss"]), t_env
             )
             self.logger.log_stat(
                 "rho_s_mean", self._mean_stat(actor_stats["rho_s_mean"]), t_env
@@ -295,12 +279,17 @@ class FPOContinuousLearner:
 
     def train_critic_sequential(self, critic, target_critic, batch, rewards, mask):
         with th.no_grad():
-            target_vals = target_critic(batch).squeeze(3)
+            target_vals = target_critic(batch).squeeze(3)   # [B, T+1, N]
 
         if self.args.standardise_returns:
             target_vals = target_vals * th.sqrt(self.ret_ms.var) + self.ret_ms.mean
 
-        target_returns = self.nstep_returns(rewards, mask, target_vals, self.args.q_nstep)
+        terminated = batch["terminated"][:, :-1].float()   # [B, T, 1]
+        gae_lambda = getattr(self.args, "gae_lambda", 0.95)
+        advantages = self.compute_gae(
+            rewards, mask, target_vals, terminated, self.args.gamma, gae_lambda
+        )                                                   # [B, T, N], masked
+        target_returns = advantages + target_vals[:, :-1]  # λ-returns for critic
 
         if self.args.standardise_returns:
             self.ret_ms.update(target_returns)
@@ -325,25 +314,30 @@ class FPOContinuousLearner:
         running_log["td_error_abs"].append(masked_td_error.abs().sum().item() / mask_elems)
         running_log["value_mean"].append((v * mask).sum().item() / mask_elems)
         running_log["target_mean"].append((target_returns * mask).sum().item() / mask_elems)
-        return masked_td_error, running_log
+        return advantages, running_log
 
-    def nstep_returns(self, rewards, mask, values, nsteps):
-        nstep_values = th.zeros_like(values[:, :-1])
-        for t_start in range(rewards.size(1)):
-            nstep_return_t = th.zeros_like(values[:, 0])
-            for step in range(nsteps + 1):
-                t = t_start + step
-                if t >= rewards.size(1):
-                    break
-                elif step == nsteps:
-                    nstep_return_t += self.args.gamma ** step * values[:, t] * mask[:, t]
-                elif t == rewards.size(1) - 1 and self.args.add_value_last_step:
-                    nstep_return_t += self.args.gamma ** step * rewards[:, t] * mask[:, t]
-                    nstep_return_t += self.args.gamma ** (step + 1) * values[:, t + 1]
-                else:
-                    nstep_return_t += self.args.gamma ** step * rewards[:, t] * mask[:, t]
-            nstep_values[:, t_start, :] = nstep_return_t
-        return nstep_values
+    def compute_gae(self, rewards, mask, values, terminated, gamma, gae_lambda):
+        """GAE advantage estimation (backward pass).
+
+        rewards:    [B, T, N]
+        mask:       [B, T, N]
+        values:     [B, T+1, N]  target critic values (includes bootstrap at T)
+        terminated: [B, T, 1]    1 if episode ended at step t
+        Returns:    advantages [B, T, N], zeroed at invalid steps
+        """
+        T = rewards.size(1)
+        gae = th.zeros_like(values[:, 0])    # [B, N]
+        advantages = th.zeros_like(rewards)   # [B, T, N]
+
+        for t in reversed(range(T)):
+            next_non_terminal = 1.0 - terminated[:, t]   # [B, 1], broadcast over N
+            delta = (rewards[:, t]
+                     + gamma * values[:, t + 1] * next_non_terminal
+                     - values[:, t])
+            gae = delta + gamma * gae_lambda * next_non_terminal * gae
+            advantages[:, t] = gae
+
+        return advantages * mask
 
     def _mean_stat(self, values):
         return sum(values) / max(1, len(values))

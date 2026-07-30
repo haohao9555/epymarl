@@ -16,7 +16,6 @@ fpo_minibatch_size: 256
 # CFM neighbourhood points sampled per transition.
 cfm_n_samples: 10
 cfm_rho_clip: 3.0
-cfm_reg_coef: 0.5
 cfm_loss_clamp: 5.0
 cfm_rollout_steps: 10
 entropy_coef: 0.1

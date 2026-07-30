@@ -22,7 +22,9 @@ fpo_rollout_timesteps: 2048
 cfm_n_samples: 50
 cfm_rho_clip: 3.0
 cfm_target_type: "velocity"
-cfm_reg_coef: 0.5
+
+# Euler integration steps for rollout/eval sampling (t=0 -> t=1).
+cfm_rollout_steps: 10
 
 # Shuffle the collected rollout transitions and train for 10 passes.
 fpo_minibatch_size: 256
@@ -40,7 +42,7 @@ obs_individual_obs: False
 use_rnn: True
 standardise_returns: False
 standardise_rewards: True
-q_nstep: 5
+gae_lambda: 0.95
 eps_clip: 0.2
 name: "mafpo_continuous_individual_reward"
 
