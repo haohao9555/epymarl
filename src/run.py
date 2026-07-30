@@ -1,0 +1,426 @@
+import datetime
+import os
+from os.path import dirname, abspath
+import pprint
+import shutil
+import time
+import threading
+from types import SimpleNamespace as SN
+
+import torch as th
+
+from controllers import REGISTRY as mac_REGISTRY
+from components.episode_buffer import ReplayBuffer
+from components.transforms import OneHot
+from learners import REGISTRY as le_REGISTRY
+from runners import REGISTRY as r_REGISTRY
+from utils.general_reward_support import test_alg_config_supports_reward
+from utils.logging import Logger
+from utils.timehelper import time_left, time_str
+
+
+def run(_run, _config, _log):
+    # check args sanity
+    _config = args_sanity_check(_config, _log)
+
+    args = SN(**_config)
+    args.device = "cuda" if args.use_cuda else "cpu"
+    assert test_alg_config_supports_reward(
+        args
+    ), "The specified algorithm does not support the general reward setup. Please choose a different algorithm or set `common_reward=True`."
+
+    # setup loggers
+    logger = Logger(_log)
+
+    _log.info("Experiment Parameters:")
+    experiment_params = pprint.pformat(_config, indent=4, width=1)
+    _log.info("\n\n" + experiment_params + "\n")
+
+    # configure tensorboard logger
+    # unique_token = "{}__{}".format(args.name, datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+
+    try:
+        map_name = _config["env_args"]["map_name"]
+    except:
+        map_name = _config["env_args"]["key"]
+    unique_token = (
+        f"{_config['name']}_seed{_config['seed']}_{map_name}_{datetime.datetime.now()}"
+    )
+
+    args.unique_token = unique_token
+    if args.use_tensorboard:
+        tb_logs_direc = os.path.join(
+            dirname(dirname(abspath(__file__))), "results", "tb_logs"
+        )
+        tb_exp_direc = os.path.join(tb_logs_direc, "{}").format(unique_token)
+        logger.setup_tb(tb_exp_direc)
+
+    if args.use_wandb:
+        logger.setup_wandb(
+            _config, args.wandb_team, args.wandb_project, args.wandb_mode
+        )
+
+    # sacred is on by default
+    logger.setup_sacred(_run)
+
+    # Run and train
+    run_sequential(args=args, logger=logger)
+
+    # Finish logging
+    logger.finish()
+
+    # Clean up after finishing
+    print("Exiting Main")
+
+    print("Stopping all threads")
+    for t in threading.enumerate():
+        if t.name != "MainThread":
+            print("Thread {} is alive! Is daemon: {}".format(t.name, t.daemon))
+            t.join(timeout=1)
+            print("Thread joined")
+
+    print("Exiting script")
+
+    # Making sure framework really exits
+    # os._exit(os.EX_OK)
+
+
+def evaluate_sequential(args, runner):
+    for _ in range(args.test_nepisode):
+        runner.run(test_mode=True)
+
+    if args.save_replay:
+        runner.save_replay()
+
+    runner.close_env()
+
+
+def _record_mov_available(args, logger):
+    if not getattr(args, "record_mov", False):
+        return False
+    try:
+        import imageio.v2 as imageio
+        import numpy as np
+        test_dir = os.path.join(args.local_results_path, "videos", "_preflight")
+        os.makedirs(test_dir, exist_ok=True)
+        test_path = os.path.join(test_dir, "record_mov_preflight.mov")
+        frame = np.zeros((8, 8, 3), dtype=np.uint8)
+        imageio.mimsave(test_path, [frame, frame], fps=getattr(args, "record_mov_fps", 10))
+        try:
+            os.remove(test_path)
+        except OSError:
+            pass
+        logger.console_logger.info(".mov recording preflight passed")
+        return True
+    except Exception as exc:
+        logger.console_logger.warning(".mov recording is disabled; preflight failed: %s", exc)
+        return False
+
+
+def _safe_filename_part(value):
+    return "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in str(value))
+
+
+def _format_timestep(step):
+    if step % 1000000 == 0:
+        return f"{step // 1000000}M"
+    if step % 1000 == 0:
+        return f"{step // 1000}K"
+    return str(step)
+
+
+def _next_record_path(args, timestep):
+    clamp = getattr(args, "cfm_loss_clamp", "na")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = "{}_seed{}_clamp{}_t{}_{}.mov".format(
+        _safe_filename_part(args.name),
+        _safe_filename_part(args.seed),
+        _safe_filename_part(clamp),
+        _format_timestep(int(timestep)),
+        timestamp,
+    )
+    record_dir = os.path.join(args.local_results_path, "videos", _safe_filename_part(args.unique_token))
+    path = os.path.join(record_dir, filename)
+    base, ext = os.path.splitext(path)
+    suffix = 1
+    while os.path.exists(path):
+        path = f"{base}_{suffix:03d}{ext}"
+        suffix += 1
+    return path
+def run_sequential(args, logger):
+    if getattr(args, "record_mov", False) and getattr(args, "env", None) == "gymma":
+        args.env_args["record_rgb_array"] = True
+
+    # Init runner so we can get env info
+    runner = r_REGISTRY[args.runner](args=args, logger=logger)
+
+    # Set up schemes and groups here
+    env_info = runner.get_env_info()
+    args.n_agents = env_info["n_agents"]
+    args.n_actions = env_info["n_actions"]
+    args.state_shape = env_info["state_shape"]
+    # ------ 新增：obs_shape 供 FPO flow_policy 使用 ----------
+    # -------------------------------------------------------------------------
+    args.obs_shape = env_info["obs_shape"]
+    # -------------------------------------------------------------------------
+
+    # Default/Base scheme
+    # ------ 改：根据 continuous_actions 标志选择 actions 的存储格式和 preprocess ----------
+    # -----------------------------------------------------------------------------
+    _continuous = env_info.get("continuous_actions", False)
+    # -----------------------------------------------------------------------------
+    scheme = {
+        "state": {"vshape": env_info["state_shape"]},
+        "obs": {"vshape": env_info["obs_shape"], "group": "agents"},
+        # ------ 改：连续动作存浮点向量，离散存单个 long 索引 ----------
+        # -----------------------------------------------------------------------------
+        "actions": (
+            {"vshape": (env_info["n_actions"],), "group": "agents", "dtype": th.float32}
+            if _continuous else
+            {"vshape": (1,), "group": "agents", "dtype": th.long}
+        ),
+        # -----------------------------------------------------------------------------
+        "avail_actions": {
+            "vshape": (env_info["n_actions"],),
+            "group": "agents",
+            "dtype": th.int,
+        },
+        "terminated": {"vshape": (1,), "dtype": th.uint8},
+    }
+    # For individual rewards in gymmai reward is of shape (1, n_agents)
+    if args.common_reward:
+        scheme["reward"] = {"vshape": (1,)}
+    else:
+        scheme["reward"] = {"vshape": (args.n_agents,)}
+    #---------------新增：FPO batch 字段------------------------------
+    if args.runner == "fpo_episode" or args.learner in ("fpo_learner", "fpo_continuous_learner", "fpo_discrete_learner"):
+        args.cfm_n_samples = getattr(args, "cfm_n_samples", 1)
+        args.cfm_action_dim = getattr(args, "cfm_action_dim", args.n_actions)
+        scheme["cfm_eps"] = {
+            "vshape": (args.cfm_n_samples, args.cfm_action_dim),
+            "group": "agents",
+        }
+        scheme["cfm_t"] = {
+            "vshape": (args.cfm_n_samples, 1),
+            "group": "agents",
+        }
+        scheme["initial_cfm_loss"] = {
+            "vshape": (args.cfm_n_samples, 1),
+            "group": "agents",
+        }
+    #----------------------
+    groups = {"agents": args.n_agents}
+    # ------ 改：连续动作不需要 one-hot 预处理，离散保持原逻辑 ----------
+    # -----------------------------------------------------------------------------
+    if _continuous:
+        preprocess = {}
+    else:
+        preprocess = {"actions": ("actions_onehot", [OneHot(out_dim=args.n_actions)])}
+    # -----------------------------------------------------------------------------
+
+    buffer = ReplayBuffer(
+        scheme,
+        groups,
+        args.buffer_size,
+        env_info["episode_limit"] + 1,
+        preprocess=preprocess,
+        device="cpu" if args.buffer_cpu_only else args.device,
+    )
+
+    # Setup multiagent controller here
+    mac = mac_REGISTRY[args.mac](buffer.scheme, groups, args)
+
+    # Give runner the scheme
+    runner.setup(scheme=scheme, groups=groups, preprocess=preprocess, mac=mac)
+
+    # Learner
+    learner = le_REGISTRY[args.learner](mac, buffer.scheme, logger, args)
+
+    if args.use_cuda:
+        learner.cuda()
+
+    if args.checkpoint_path != "":
+        timesteps = []
+        timestep_to_load = 0
+
+        if not os.path.isdir(args.checkpoint_path):
+            logger.console_logger.info(
+                "Checkpoint directiory {} doesn't exist".format(args.checkpoint_path)
+            )
+            return
+
+        # Go through all files in args.checkpoint_path
+        for name in os.listdir(args.checkpoint_path):
+            full_name = os.path.join(args.checkpoint_path, name)
+            # Check if they are dirs the names of which are numbers
+            if os.path.isdir(full_name) and name.isdigit():
+                timesteps.append(int(name))
+
+        if args.load_step == 0:
+            # choose the max timestep
+            timestep_to_load = max(timesteps)
+        else:
+            # choose the timestep closest to load_step
+            timestep_to_load = min(timesteps, key=lambda x: abs(x - args.load_step))
+
+        model_path = os.path.join(args.checkpoint_path, str(timestep_to_load))
+
+        logger.console_logger.info("Loading model from {}".format(model_path))
+        learner.load_models(model_path)
+        runner.t_env = timestep_to_load
+
+        if args.evaluate or args.save_replay:
+            runner.log_train_stats_t = runner.t_env
+            evaluate_sequential(args, runner)
+            logger.log_stat("episode", runner.t_env, runner.t_env)
+            logger.print_recent_stats()
+            logger.console_logger.info("Finished Evaluation")
+            return
+
+    # start training
+    episode = 0
+    last_test_T = -args.test_interval - 1
+    last_log_T = 0
+    model_save_time = 0
+
+    start_time = time.time()
+    last_time = start_time
+
+    logger.console_logger.info("Beginning training for {} timesteps".format(args.t_max))
+    record_mov_enabled = _record_mov_available(args, logger)
+    record_mov_steps = sorted(int(t) for t in getattr(args, "record_mov_timesteps", []))
+    recorded_mov_steps = set()
+
+    is_fpo_transition_batch = args.learner in ("fpo_continuous_learner", "fpo_discrete_learner")
+    fpo_rollout_timesteps = getattr(args, "fpo_rollout_timesteps", 2048)
+    fpo_collected_timesteps = 0
+
+    while runner.t_env <= args.t_max:
+        # Run for a whole episode at a time
+        episode_batch = runner.run(test_mode=False)
+        buffer.insert_episode_batch(episode_batch)
+
+        if is_fpo_transition_batch:
+            # FPO is trained as an on-policy transition batch: keep collecting
+            # complete episodes until they contain roughly fpo_rollout_timesteps
+            # valid transitions, then train once and clear the episode buffer.
+            fpo_collected_timesteps += int(
+                episode_batch["filled"].sum().item() - episode_batch.batch_size
+            )
+            should_train = (
+                fpo_collected_timesteps >= fpo_rollout_timesteps
+                or buffer.episodes_in_buffer >= args.buffer_size
+            )
+        else:
+            should_train = buffer.can_sample(args.batch_size)
+
+        if should_train:
+            if is_fpo_transition_batch:
+                episode_sample = buffer[:buffer.episodes_in_buffer]
+            else:
+                episode_sample = buffer.sample(args.batch_size)
+
+            # Truncate batch to only filled timesteps
+            max_ep_t = episode_sample.max_t_filled()
+            episode_sample = episode_sample[:, :max_ep_t]
+
+            if episode_sample.device != args.device:
+                episode_sample.to(args.device)
+
+            learner.train(episode_sample, runner.t_env, episode)
+
+            if is_fpo_transition_batch:
+                # The FPO ratio is only meaningful against the rollout policy
+                # that generated these eps/t/action points, so drop old data
+                # after one train call instead of replaying it later.
+                buffer.buffer_index = 0
+                buffer.episodes_in_buffer = 0
+                fpo_collected_timesteps = 0
+
+        if record_mov_enabled:
+            due_steps = [
+                step for step in record_mov_steps
+                if step <= runner.t_env and step not in recorded_mov_steps
+            ]
+            for record_step in due_steps:
+                record_path = _next_record_path(args, record_step)
+                logger.console_logger.info(
+                    "Recording evaluation episode at %s steps to %s",
+                    record_step,
+                    record_path,
+                )
+                runner.run(test_mode=True, record_path=record_path)
+                recorded_mov_steps.add(record_step)
+
+        # Execute test runs once in a while
+        n_test_runs = max(1, args.test_nepisode // runner.batch_size)
+        if (runner.t_env - last_test_T) / args.test_interval >= 1.0:
+            logger.console_logger.info(
+                "t_env: {} / {}".format(runner.t_env, args.t_max)
+            )
+            logger.console_logger.info(
+                "Estimated time left: {}. Time passed: {}".format(
+                    time_left(last_time, last_test_T, runner.t_env, args.t_max),
+                    time_str(time.time() - start_time),
+                )
+            )
+            last_time = time.time()
+
+            last_test_T = runner.t_env
+            for _ in range(n_test_runs):
+                runner.run(test_mode=True)
+
+        if args.save_model and (
+            runner.t_env - model_save_time >= args.save_model_interval
+            or model_save_time == 0
+        ):
+            model_save_time = runner.t_env
+            save_path = os.path.join(
+                args.local_results_path, "models", args.unique_token, str(runner.t_env)
+            )
+            # "results/models/{}".format(unique_token)
+            os.makedirs(save_path, exist_ok=True)
+            logger.console_logger.info("Saving models to {}".format(save_path))
+
+            # learner should handle saving/loading -- delegate actor save/load to mac,
+            # use appropriate filenames to do critics, optimizer states
+            learner.save_models(save_path)
+
+            if args.use_wandb and args.wandb_save_model:
+                wandb_save_dir = os.path.join(
+                    logger.wandb.dir, "models", args.unique_token, str(runner.t_env)
+                )
+                os.makedirs(wandb_save_dir, exist_ok=True)
+                for f in os.listdir(save_path):
+                    shutil.copyfile(
+                        os.path.join(save_path, f), os.path.join(wandb_save_dir, f)
+                    )
+
+        episode += args.batch_size_run
+
+        if (runner.t_env - last_log_T) >= args.log_interval:
+            logger.log_stat("episode", episode, runner.t_env)
+            logger.print_recent_stats()
+            last_log_T = runner.t_env
+
+    runner.close_env()
+    logger.console_logger.info("Finished Training")
+
+
+def args_sanity_check(config, _log):
+    # set CUDA flags
+    # config["use_cuda"] = True # Use cuda whenever possible!
+    if config["use_cuda"] and not th.cuda.is_available():
+        config["use_cuda"] = False
+        _log.warning(
+            "CUDA flag use_cuda was switched OFF automatically because no CUDA devices are available!"
+        )
+
+    if config["test_nepisode"] < config["batch_size_run"]:
+        config["test_nepisode"] = config["batch_size_run"]
+    else:
+        config["test_nepisode"] = (
+            config["test_nepisode"] // config["batch_size_run"]
+        ) * config["batch_size_run"]
+
+    return config
