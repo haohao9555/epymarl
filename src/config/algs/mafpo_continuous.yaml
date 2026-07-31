@@ -45,7 +45,7 @@ name: "mafpo_continuous"
 
 use_wandb: True
 wandb_team: "adolf9555-university-of-technology-sydney"
-wandb_project: "epymarl-mpe"
+wandb_project: "MPE continuous algorithm"
 wandb_run_name: "MAFPO-MPE"
 wandb_mode: "online"
 

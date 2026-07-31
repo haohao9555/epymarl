@@ -34,7 +34,7 @@ name: "mappo_continuous"
 
 use_wandb: True
 wandb_team: "adolf9555-university-of-technology-sydney"
-wandb_project: "epymarl-mpe"
+wandb_project: "MPE continuous algorithm"
 wandb_mode: "online"
 
 beta_param_epsilon: 0.0001
