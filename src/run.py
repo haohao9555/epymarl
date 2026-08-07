@@ -208,6 +208,21 @@ def run_sequential(args, logger):
             "vshape": (args.cfm_n_samples, 1),
             "group": "agents",
         }
+        # Pre-clamp integration endpoint, for diagnosing whether actions pinned
+        # at the [0,1] boundary are just-barely-there or wildly overshooting.
+        scheme["action_raw"] = {
+            "vshape": (args.cfm_action_dim,),
+            "group": "agents",
+        }
+        # Real injected Gaussian noise n ~ N(0,sigma^2), saved separately from
+        # the clamped action -- once clamp() actually truncates a sample,
+        # (action - action_raw) is no longer the true Gaussian draw, so the
+        # PolicyFlow ratio's likelihood term needs this exact value, not a
+        # reconstruction from the post-clamp action.
+        scheme["action_noise"] = {
+            "vshape": (args.cfm_action_dim,),
+            "group": "agents",
+        }
     #----------------------
     groups = {"agents": args.n_agents}
     # ------ 改：连续动作不需要 one-hot 预处理，离散保持原逻辑 ----------

@@ -29,24 +29,32 @@ class FPOMAC:
         B = ep_batch.batch_size
 
         if test_mode:
-            # 确定性评估：用 eps=0（N(0,I) 的众数）而不是重新随机采样，
+            # 确定性评估：用 eps=0.5（Uniform(0,1) 的中心）而不是重新随机采样，
             # 与 BetaActionSelector 在 test_mode 下返回分布均值而非 sample() 的约定一致
             # （见 components/action_selectors.py 的 BetaActionSelector）。
             h = self.agent.encode(inputs, self.hidden_states)
             self.hidden_states = h
             n_act = self.args.n_actions
-            eps = th.zeros(*h.shape[:-1], n_act, device=h.device)
+            eps = th.full((*h.shape[:-1], n_act), 0.5, device=h.device)
             n_steps = getattr(self.args, "cfm_rollout_steps", 1)
             x1 = self.agent.integrate(h, eps, n_steps)
             action = th.clamp(x1, 0.0, 1.0)
             self._last_eps = eps
+            self._last_x1_raw = x1
+            self._last_noise = th.zeros_like(x1)   # 确定性评估不加噪声
         else:
-            action, self.hidden_states, self._last_eps = self.agent.sample_action(
-                inputs, self.hidden_states
-            )
+            (
+                action,
+                self.hidden_states,
+                self._last_eps,
+                self._last_x1_raw,
+                self._last_noise,
+            ) = self.agent.sample_action(inputs, self.hidden_states)
 
-        # action: [B*N, n_actions] → [B, N, n_actions]
+        # action / x1_raw / noise: [B*N, n_actions] → [B, N, n_actions]
         action = action.view(B, self.n_agents, -1)
+        self._last_x1_raw = self._last_x1_raw.view(B, self.n_agents, -1)
+        self._last_noise = self._last_noise.view(B, self.n_agents, -1)
         return action[bs]
 
     # ── learner forward（返回 h 供 CFM loss 计算）────────────────────────────

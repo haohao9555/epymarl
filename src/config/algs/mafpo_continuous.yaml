@@ -17,8 +17,23 @@ fpo_rollout_timesteps: 2048
 
 # Each environment timestep stores this many fixed CFM neighbourhood points.
 cfm_n_samples: 10
-cfm_rho_clip: 3.0
+# Tightened from 3.0: caps how far rho_s can reach (exp(1.5)=4.5 vs exp(3)=20)
+# before eps_clip's trust region even engages, shrinking the "active but
+# unprotected" zone that let single minibatches drive pg_loss to 20-40.
+cfm_rho_clip: 1.5
 cfm_target_type: "velocity"
+
+# Bound the velocity network's output to [-cfm_velocity_bound, cfm_velocity_bound]
+# via tanh. Without this, gradient ascent on cfm_loss for advantage<0 samples has
+# no ceiling and the output-layer weights diverge over long training runs.
+# Noise base is Uniform(0,1) now (see fpo_actor.py), so target=action-eps has
+# natural range [-1,1] instead of [-4,4] under a Gaussian base — 1.5 keeps a
+# comfortable margin over that tighter range.
+cfm_velocity_bound: 1.5
+# Diagnostic-only escape hatch: set False to test whether the bound is still
+# needed once use_policyflow_ratio replaces the old cfm-loss-diff ratio it was
+# originally added for. Leave True for real runs.
+use_velocity_bound: True
 
 # Euler integration steps for rollout/eval sampling (t=0 -> t=1).
 cfm_rollout_steps: 10
@@ -41,6 +56,82 @@ standardise_returns: True
 standardise_rewards: True
 gae_lambda: 0.95
 eps_clip: 0.2
+
+# FPO has no closed-form action distribution, so entropy is approximated as the
+# variance of entropy_n_samples freshly-sampled actions from the same state
+# (same h, different eps) under the current velocity field. Disabled here to
+# isolate lambda_trust's effect on its own (action collapse persisted with
+# entropy_coef=0.01, so testing one variable at a time).
+entropy_coef: 0.0
+entropy_n_samples: 4
+
+# Trust-region penalty: L_trust = E[||v_new(x_t,t) - v_old(x_t,t)||^2], where
+# v_old is a frozen snapshot of the velocity field from the start of this
+# training round (refreshed once per train() call, see old_mac in
+# fpo_continuous_learner.py). Unlike cfm_velocity_bound/cfm_rho_clip (hard caps
+# on value/ratio), this is a continuous, always-on pull back toward last
+# round's policy — directly limits how far v_pred can drift *per round*,
+# targeting the round-over-round accumulation that produces action collapse.
+# lambda_trust=1.0 measured to have zero effect (trust_loss's natural scale is
+# ~0.0005-0.0007, negligible next to pg_loss~0.04-0.13). lambda_trust=1000
+# went the other way: rho_s pinned at 1.0000 (std~0.0005) and clip_fraction=0
+# through 150k steps, i.e. v_new==v_old almost everywhere -- the policy was
+# frozen, not gently constrained (return_mean stuck at baseline ~-80). True
+# useful value is between these two extremes -- but lambda_trust=30 is NOT
+# a good middle ground either: rho_s slid from 0.978 (50k) to 0.9994 (350k),
+# i.e. still converging toward the same frozen endpoint as 1000, just slower,
+# and return_mean crashed to -138 mid-transition before settling ~-90 to -110
+# (worse than either extreme throughout). lambda_trust=10 got the closest to a
+# working middle ground (5M-step run stayed in a 39-68% action_at_bound_fraction
+# band vs the untreated baseline's 82-87%, but return was worse in the back half
+# with two unexplained transient critic-instability spikes). Switched off (0.0)
+# while testing the PolicyFlow-style regularizer below instead, to keep this a
+# single-variable test; trust_loss and brownian_loss both compare v_new to
+# v_old and would otherwise fight each other.
+lambda_trust: 0.0
+
+# PolicyFlow-style additions (arXiv:2602.01156) targeting the same action-collapse
+# failure mode from a different angle: the paper notes FPO's ELBO-based ratio is
+# asymmetrically less reliable exactly when advantage<0 wants the ratio to
+# shrink, and that FPO/DPPO collapse to a handful of modes without any entropy
+# mechanism (their MultiGoal experiment). w_b pulls the velocity field toward an
+# entropy-increasing ("Brownian") version of itself:
+#   eta_t = (1-t)*v_new(x_t,t) - (x_t - t*v_old(x_t,t))   [Eq.15]
+#   brownian_loss = E[||eta_t||^2], added to actor_loss as +w_b*brownian_loss
+# w_g is a matching exact Gaussian entropy bonus on fpo_actor's learned
+# terminal-noise sigma (sigma is real noise injected at rollout, not decorative
+# — see fpo_actor.sample_action): -w_g * 0.5*sum(log(2*pi*e*sigma^2)).
+# w_b tested in isolation (w_g=0.01, use_policyflow_ratio=False) had a real
+# bug: sigma is only ever pushed UP by w_g's entropy term (nothing in pg_loss
+# depends on sigma when the ratio is still the old cfm-loss-diff proxy), so
+# sigma_mean was already 1.12 (bigger than the whole [0,1] action range) after
+# just 50k steps with no ceiling in sight. Switching to
+# use_policyflow_ratio=True fixes this at the root: sigma appears directly in
+# the new ratio's log-likelihood, so it gets real two-directional pressure
+# from pg_loss instead of only w_g's one-way push. w_b left at 0 for now to
+# isolate use_policyflow_ratio as its own single-variable test first.
+w_b: 0.0
+w_g: 0.01
+sigma_min: 0.01
+# sigma started at exp(0)=1.0 by default -- almost the whole [0,1] action
+# range -- which mechanically manufactures boundary mass via clamp() before
+# the two-way gradient has time to correct it (truncated-Gaussian pileup at
+# the edges, same phenomenon as Beta(a<1,b<1)'s U-shape, just from oversized
+# noise instead of distribution shape). sigma_init=0.1 fixed that (19% vs 70%+
+# action_at_bound_fraction at 50k) but overcorrected: log_ratio's (n-delta_v)^2
+# / sigma^2 term makes the likelihood razor-sharp when sigma is tiny, so small
+# differences get divided by a small sigma^2 and blow up -- actor_grad_norm
+# went 42 -> 148 -> 284 (roughly doubling every 50k) over just 150k steps.
+# Trying a middle ground between 1.0 (too flat, manufactures boundary mass)
+# and 0.1 (too sharp, gradient blows up).
+sigma_init: 0.3
+
+# Replace rho_s = exp(clamp(L_old-L_new,...)) (cfm-loss-difference proxy) with
+# an exact Gaussian importance ratio treating the policy as
+# a ~ N(flow_endpoint(z;s), sigma^2). See fpo_continuous_learner.py's class
+# docstring for the full derivation. First test of this mechanism.
+use_policyflow_ratio: True
+
 name: "mafpo_continuous"
 
 use_wandb: True

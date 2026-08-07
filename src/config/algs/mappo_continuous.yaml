@@ -22,7 +22,7 @@ mac: "continuous_mac"
 agent: "rnn_continuous"
 agent_output_type: "beta"
 learner: "ppo_continuous_learner"
-entropy_coef: 0.001
+entropy_coef: 0.01
 use_rnn: True
 standardise_returns: False
 standardise_rewards: True
@@ -37,7 +37,7 @@ wandb_team: "adolf9555-university-of-technology-sydney"
 wandb_project: "MPE continuous algorithm"
 wandb_mode: "online"
 
-beta_param_epsilon: 0.0001
+beta_param_epsilon: 0.05
 beta_action_epsilon: 0.000001
 
 t_max: 20050000

@@ -83,7 +83,7 @@ class ParallelRunner:
 
     def sample_cfm_points(self, batch_size):
         return (
-            th.randn(
+            th.rand(
                 batch_size,
                 self.args.n_agents,
                 self.args.cfm_n_samples,
@@ -170,12 +170,22 @@ class ParallelRunner:
                     {
                         "cfm_eps": cfm_eps.unsqueeze(1),
                         "cfm_t": cfm_t.unsqueeze(1),
+                        # phi_hat (self.mac._last_x1_raw), not the noisy
+                        # executed action -- see fpo_continuous_learner's
+                        # _compute_cfm_loss_for_time_indices comment: the flow
+                        # is trained on z->phi only, noise stays separate.
                         "initial_cfm_loss": self.mac.compute_initial_cfm_loss(
                             cfm_eps,
                             cfm_t,
-                            actions,
+                            self.mac._last_x1_raw[envs_not_terminated],
                             bs=envs_not_terminated,
                         ).unsqueeze(1),
+                        "action_raw": self.mac._last_x1_raw[envs_not_terminated]
+                        .detach()
+                        .unsqueeze(1),
+                        "action_noise": self.mac._last_noise[envs_not_terminated]
+                        .detach()
+                        .unsqueeze(1),
                     }
                 )
             self.batch.update(

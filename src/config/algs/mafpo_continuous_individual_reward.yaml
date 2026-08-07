@@ -19,16 +19,24 @@ batch_size: 8
 fpo_rollout_timesteps: 2048
 
 # Each environment timestep stores this many fixed CFM neighbourhood points.
-cfm_n_samples: 50
-cfm_rho_clip: 3.0
+# Matched to mafpo_continuous.yaml's value (was 50) so common_reward is the
+# only variable differing between the two configs.
+cfm_n_samples: 10
+cfm_rho_clip: 1.5
 cfm_target_type: "velocity"
+
+# Bound the velocity network's output to [-cfm_velocity_bound, cfm_velocity_bound]
+# via tanh. Noise base is Uniform(0,1) now (see fpo_actor.py), so target=action-eps
+# has natural range [-1,1] instead of [-4,4] under a Gaussian base.
+cfm_velocity_bound: 1.5
 
 # Euler integration steps for rollout/eval sampling (t=0 -> t=1).
 cfm_rollout_steps: 10
 
 # Shuffle the collected rollout transitions and train for 10 passes.
+# epochs matched to mafpo_continuous.yaml's value (was 10) for the same reason.
 fpo_minibatch_size: 256
-epochs: 10
+epochs: 4
 
 target_update_interval_or_tau: 0.01
 
@@ -40,10 +48,23 @@ obs_last_action: False
 obs_individual_obs: False
 
 use_rnn: True
-standardise_returns: False
+standardise_returns: True
 standardise_rewards: True
 gae_lambda: 0.95
 eps_clip: 0.2
+
+# FPO has no closed-form action distribution, so entropy is approximated as the
+# variance of entropy_n_samples freshly-sampled actions from the same state
+# (same h, different eps) under the current velocity field. Temporarily disabled.
+entropy_coef: 0.0
+entropy_n_samples: 4
+
+# Trust-region penalty, see mafpo_continuous.yaml for the full explanation.
+# Set to 0 here to isolate common_reward=False as the single variable under
+# test against the common_reward=True runs (which all used various
+# lambda_trust values but never got below ~39-55% action_at_bound_fraction).
+lambda_trust: 0.0
+
 name: "mafpo_continuous_individual_reward"
 
 use_wandb: True

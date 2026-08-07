@@ -73,6 +73,27 @@ class PPOContinuousLearner:
         old_pi = th.stack(old_mac_out, dim=1)
         old_log_pi_taken, _ = self._get_log_prob_and_entropy(old_pi, actions)
 
+        # Action-collapse diagnostics (same definition as fpo_continuous_learner,
+        # so the two algorithms' wandb curves are directly comparable): fraction
+        # of realized actions sitting within bound_eps of 0 or 1. For a Beta
+        # policy the direct root-cause signal is whether alpha/beta themselves
+        # collapse toward the U-shaped regime (both < 1), which makes Beta(a,b)
+        # bimodal with mass piling up at both boundaries regardless of the mean.
+        bound_eps = 0.02
+        act_mask = mask.unsqueeze(-1).expand_as(actions)
+        act_mask_sum = act_mask.sum()
+        action_mean = (actions * act_mask).sum() / act_mask_sum
+        action_var = (((actions - action_mean) * act_mask) ** 2).sum() / act_mask_sum
+        action_std = th.sqrt(action_var)
+        at_bound = ((actions < bound_eps) | (actions > 1 - bound_eps)).float()
+        action_at_bound_fraction = (at_bound * act_mask).sum() / act_mask_sum
+
+        alpha_all, beta_all = old_pi.chunk(2, dim=-1)
+        alpha_mean = (alpha_all * act_mask).sum() / act_mask_sum
+        beta_mean = (beta_all * act_mask).sum() / act_mask_sum
+        u_shaped = ((alpha_all < 1.0) & (beta_all < 1.0)).float()
+        u_shaped_fraction = (u_shaped * act_mask).sum() / act_mask_sum
+
         for _ in range(self.args.epochs):
             mac_out = []
             self.mac.init_hidden(batch.batch_size)
@@ -174,6 +195,14 @@ class PPOContinuousLearner:
             self.logger.log_stat(
                 "old_log_pi_taken_mean", old_log_pi_taken_mean.item(), t_env
             )
+            self.logger.log_stat("action_mean", action_mean.item(), t_env)
+            self.logger.log_stat("action_std", action_std.item(), t_env)
+            self.logger.log_stat(
+                "action_at_bound_fraction", action_at_bound_fraction.item(), t_env
+            )
+            self.logger.log_stat("alpha_mean", alpha_mean.item(), t_env)
+            self.logger.log_stat("beta_mean", beta_mean.item(), t_env)
+            self.logger.log_stat("u_shaped_fraction", u_shaped_fraction.item(), t_env)
             self.log_stats_t = t_env
 
     def train_critic_sequential(self, critic, target_critic, batch, rewards, mask):
