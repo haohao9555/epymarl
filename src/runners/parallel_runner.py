@@ -186,6 +186,9 @@ class ParallelRunner:
                         "action_noise": self.mac._last_noise[envs_not_terminated]
                         .detach()
                         .unsqueeze(1),
+                        "z": self.mac._last_eps[envs_not_terminated]
+                        .detach()
+                        .unsqueeze(1),
                     }
                 )
             self.batch.update(

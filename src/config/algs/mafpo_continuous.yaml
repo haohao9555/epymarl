@@ -108,9 +108,22 @@ lambda_trust: 0.0
 # just 50k steps with no ceiling in sight. Switching to
 # use_policyflow_ratio=True fixes this at the root: sigma appears directly in
 # the new ratio's log-likelihood, so it gets real two-directional pressure
-# from pg_loss instead of only w_g's one-way push. w_b left at 0 for now to
-# isolate use_policyflow_ratio as its own single-variable test first.
-w_b: 0.0
+# from pg_loss instead of only w_g's one-way push.
+#
+# w_b was left at 0 while use_policyflow_ratio + its 4 implementation bugs
+# (cfm_eps-vs-real-z, pre-averaging delta_v over t, v_old using self.mac's
+# hidden state instead of old_mac's own, tanh saturation not scaling with
+# cfm_velocity_bound) were being isolated and fixed one at a time. With all
+# four fixed, action collapse changed from runaway (>90% by 2M, accelerating)
+# to a slow, decelerating climb that reached ~85% by 6.5M without ever
+# plateauing or hurting return (which stabilized near -47, close to MAPPO's
+# -40.4). Turning on w_b now to see whether the Brownian regularizer -- the
+# one mechanism in this whole design specifically aimed at maintaining
+# diversity/entropy in the velocity field, never yet tested in combination
+# with the real ratio -- can arrest that residual slow climb. Untuned
+# starting point; watch brownian_loss's natural scale (never observed live
+# yet, always 0 so far) before judging if this is too small/large.
+w_b: 0.1
 w_g: 0.01
 sigma_min: 0.01
 # sigma started at exp(0)=1.0 by default -- almost the whole [0,1] action

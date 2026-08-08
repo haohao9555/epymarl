@@ -85,6 +85,17 @@ class FPOActor(nn.Module):
         本身没有上界，长期训练会把 vel_fc2 的权重推到发散。限幅之后 v_pred 出不
         了这个范围，cfm_loss 天然有上限，同时饱和区梯度趋于 0，权重也不会被继
         续无限推大。
+
+        用 bound*tanh(raw/bound) 而不是 bound*tanh(raw)：tanh 本身的饱和阈值固
+        定在 raw≈±2~3，跟 bound 无关——如果直接 bound*tanh(raw)，调小 bound(比
+        如从 8.0 调到 1.5)并不会让"需要多大的 raw 才饱和"跟着变，饱和依然在
+        raw≈3 附近发生，只是乘出来的动态范围变窄了。这样 raw 更容易被推过这个
+        固定阈值进入饱和区，一旦 v_new 和 v_old 都饱和，输出几乎相等（tanh 在
+        那里梯度趋于 0），δv=v_new-v_old 会被人为压得很小——这是 PolicyFlow
+        ratio 的 delta_v 持续萎缩、修正信号消失的第三个来源（另外两个是 v_old
+        错用了新网络的 hidden state、以及对多个 t 采样点先平均再算 ratio）。
+        先除以 bound 再过 tanh，饱和阈值会跟着 bound 等比例缩放，raw 对 bound
+        的相对灵敏度不再因为调小 bound 而意外改变。
         """
         inp = th.cat([h, x_t, t], dim=-1)
         raw = self.vel_fc2(F.relu(self.vel_fc1(inp)))
@@ -96,7 +107,7 @@ class FPOActor(nn.Module):
             # delta_v in the new ratio instead -- see conversation notes.
             return raw
         bound = getattr(self.args, "cfm_velocity_bound", 8.0)
-        return bound * th.tanh(raw)
+        return bound * th.tanh(raw / bound)
 
     # ── MAC 兼容接口 ──────────────────────────────────────────────────────────
 

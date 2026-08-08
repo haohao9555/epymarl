@@ -223,6 +223,15 @@ def run_sequential(args, logger):
             "vshape": (args.cfm_action_dim,),
             "group": "agents",
         }
+        # The real z (flow's t=0 starting point) that generated this rollout's
+        # action, saved so the PolicyFlow ratio's delta_v can be estimated by
+        # interpolating along the true z->phi_hat path instead of the separate
+        # cfm_eps neighborhood samples (paper's own design; cfm_eps is a
+        # different, additional set of points used only for the CFM loss).
+        scheme["z"] = {
+            "vshape": (args.cfm_action_dim,),
+            "group": "agents",
+        }
     #----------------------
     groups = {"agents": args.n_agents}
     # ------ 改：连续动作不需要 one-hot 预处理，离散保持原逻辑 ----------

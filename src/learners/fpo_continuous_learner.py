@@ -131,6 +131,42 @@ class FPOContinuousLearner:
         else:
             action_overshoot_mean = action_overshoot_at_bound_mean = 0.0
 
+        # The above only checks "did the ODE (phi) leave the road" -- it says
+        # nothing about whether phi was fine but got knocked out of [0,1] by
+        # the added terminal noise n. What actually gets clamped is phi+n,
+        # not phi alone, so measure that overshoot separately using the real
+        # stored noise (batch["action_noise"]). Comparing this against the
+        # phi-only overshoot above tells us how much of the boundary-pinning
+        # is the flow's own doing vs. purely noise-driven.
+        if "action_raw" in batch.scheme and "action_noise" in batch.scheme:
+            action_noise = batch["action_noise"][:, :-1].float()      # [B,T,N,A]
+            noisy_raw = action_raw + action_noise                     # phi + n, pre-clamp
+            valid_noisy_raw = noisy_raw[action_valid]
+            noisy_overshoot = (
+                th.clamp(-valid_noisy_raw, min=0) + th.clamp(valid_noisy_raw - 1, min=0)
+            )
+            action_noisy_overshoot_mean = (
+                noisy_overshoot.mean().item() if noisy_overshoot.numel() > 0 else 0.0
+            )
+            if valid_actions.numel() > 0 and at_bound.any():
+                action_noisy_overshoot_at_bound_mean = noisy_overshoot[at_bound].mean().item()
+            else:
+                action_noisy_overshoot_at_bound_mean = 0.0
+            # Of the samples that ended up at the boundary, how many had phi
+            # itself already inside [0,1] -- i.e. were only pushed out by n?
+            phi_valid_raw = valid_raw  # from the block above, phi alone
+            phi_was_inside = (phi_valid_raw >= 0) & (phi_valid_raw <= 1)
+            if valid_actions.numel() > 0 and at_bound.any():
+                action_at_bound_from_noise_fraction = (
+                    (phi_was_inside & at_bound).float().sum().item()
+                    / at_bound.float().sum().item()
+                )
+            else:
+                action_at_bound_from_noise_fraction = 0.0
+        else:
+            action_noisy_overshoot_mean = action_noisy_overshoot_at_bound_mean = 0.0
+            action_at_bound_from_noise_fraction = 0.0
+
         initial_cfm_loss = batch["initial_cfm_loss"][:, :-1]    # [B,T,N,cfm_n,1]
         rho_clip = getattr(self.args, "cfm_rho_clip", 3.0)
         entropy_coef = getattr(self.args, "entropy_coef", 0.0)
@@ -170,6 +206,23 @@ class FPOContinuousLearner:
                             "target_mean", "value_mean"]
         }
 
+        # Hidden states from old_mac's OWN encoder, computed once since
+        # old_mac is frozen for the whole train() call. Every v_old(...) call
+        # below must use this, never h_seq (which is rebuilt from self.mac's
+        # encoder every minibatch as mac updates) -- the encoder (fc1/GRU)
+        # does most of the representational work, so feeding old_mac's
+        # velocity head the *new* encoder's hidden state made v_old and v_new
+        # share almost everything except the small output-layer difference,
+        # artificially shrinking delta_v more and more as mac's encoder
+        # drifted from old_mac's -- this was found to be the dominant cause
+        # of delta_v_abs_mean collapsing toward 0 as action collapse
+        # deepened, on top of the cfm_eps-vs-real-z and pre-averaging bugs
+        # fixed earlier.
+        old_h_seq = None
+        if need_v_old:
+            with th.no_grad():
+                old_h_seq = self._build_old_actor_hidden_sequence(batch)
+
         for _ in range(self.args.epochs):
             # The critic still uses full sequences for GAE. We train it once
             # per epoch, then freeze the advantages for the shuffled actor
@@ -200,15 +253,23 @@ class FPOContinuousLearner:
 
                 # Trust-region penalty: keep this round's velocity field close to
                 # the field that generated the rollout, evaluated at the exact
-                # same (h, x_t, t) points already used for the CFM loss above.
+                # same (x_t, t) points already used for the CFM loss above (but
+                # through old_mac's OWN hidden state -- see old_h_seq comment,
+                # never mb_flat_h, which comes from self.mac's encoder).
                 # Unlike eps_clip (which only gates whether a sample's gradient
                 # fires at all), this is a continuous, always-on pull back toward
                 # last round's policy, directly limiting how far v_pred can drift
                 # per round regardless of advantage sign.
                 if need_v_old:
+                    old_h_flat = old_h_seq.reshape(-1, self.n_agents, old_h_seq.shape[-1])
+                    mb_old_h = old_h_flat[mb_time_idx]              # [M,N,H]
+                    mb_old_h_exp = mb_old_h.unsqueeze(2).expand(
+                        -1, -1, mb_v_new.shape[2], -1
+                    )
+                    old_flat_h = mb_old_h_exp.reshape(-1, mb_old_h_exp.shape[-1])
                     with th.no_grad():
                         v_old = self.old_mac.agent.velocity(
-                            mb_flat_h, mb_flat_x_t, mb_flat_t
+                            old_flat_h, mb_flat_x_t, mb_flat_t
                         ).reshape_as(mb_v_new)
                 if lambda_trust > 0.0:
                     trust_loss = ((mb_v_new - v_old) ** 2).mean()
@@ -263,28 +324,95 @@ class FPOContinuousLearner:
                     # draw (it's the noise it *would* have taken had clamping
                     # not intervened, which is a biased quantity exactly on the
                     # boundary-heavy samples this whole investigation is about).
+                    #
                     # delta_v approximates how far the flow endpoint would shift
-                    # under the NEW policy, estimated from the same CFM
-                    # neighborhood points as cfm_loss/eta_t above (no extra
-                    # sampling, no ODE re-integration).
+                    # under the NEW policy. This must be evaluated along the
+                    # REAL rollout path z->phi_hat (the paper's own design),
+                    # not the separate cfm_eps neighborhood points used for the
+                    # CFM loss above -- those are extra, independently-sampled
+                    # probe points with no relation to the z that actually
+                    # produced this transition's action, and using them here
+                    # was found empirically to make the ratio's corrective
+                    # signal collapse toward 0 (delta_v_abs_mean shrank as
+                    # action_at_bound_fraction climbed to 90%+ in a 2M-step
+                    # run), i.e. too weak to resist collapse. This costs one
+                    # extra pair of velocity() calls (mac + old_mac) at the
+                    # cfm_t sample points, reused only as a Monte Carlo t-grid
+                    # along the new, correct interpolation line.
                     n_flat = batch["action_noise"][:, :-1].float().reshape(
                         -1, self.n_agents, self.n_actions
                     )
+                    z_flat = batch["z"][:, :-1].float().reshape(
+                        -1, self.n_agents, self.n_actions
+                    )
+                    phi_flat = batch["action_raw"][:, :-1].float().reshape(
+                        -1, self.n_agents, self.n_actions
+                    )
                     n_noise = n_flat[mb_time_idx]                   # [M,N,A]
-                    delta_v = (mb_v_new - v_old).mean(dim=2)        # [M,N,cfm_n,A] -> [M,N,A]
+                    mb_z = z_flat[mb_time_idx]                      # [M,N,A]
+                    mb_phi = phi_flat[mb_time_idx]                  # [M,N,A]
+
+                    cfm_n = mb_cfm_loss.shape[2]
+                    z_exp = mb_z.unsqueeze(2).expand(-1, -1, cfm_n, -1)
+                    phi_exp = mb_phi.unsqueeze(2).expand(-1, -1, cfm_n, -1)
+                    t_grid = mb_flat_t.reshape(mb_z.shape[0], mb_z.shape[1], cfm_n, 1)
+                    x_t_real = (1 - t_grid) * z_exp + t_grid * phi_exp   # [M,N,cfm_n,A]
+
+                    h_exp_real = mb_flat_h.reshape(
+                        mb_z.shape[0], mb_z.shape[1], cfm_n, -1
+                    )
+                    flat_h_real = h_exp_real.reshape(-1, h_exp_real.shape[-1])
+                    flat_x_t_real = x_t_real.reshape(-1, x_t_real.shape[-1])
+                    flat_t_real = t_grid.reshape(-1, 1)
+
+                    v_new_real = self.mac.agent.velocity(
+                        flat_h_real, flat_x_t_real, flat_t_real
+                    ).reshape_as(x_t_real)
+                    # v_old must go through old_mac's OWN encoder output
+                    # (mb_old_h, built above from old_h_seq), never mb_flat_h
+                    # / flat_h_real which come from self.mac's encoder.
+                    old_h_exp_real = mb_old_h.unsqueeze(2).expand(-1, -1, cfm_n, -1)
+                    old_flat_h_real = old_h_exp_real.reshape(-1, old_h_exp_real.shape[-1])
+                    with th.no_grad():
+                        v_old_real = self.old_mac.agent.velocity(
+                            old_flat_h_real, flat_x_t_real, flat_t_real
+                        ).reshape_as(x_t_real)
+
+                    # Do NOT average delta_v over the cfm_n t-samples before
+                    # building the ratio: log_ratio is quadratic in delta_v, so
+                    # E_t[log_ratio(delta_v_t)] != log_ratio(E_t[delta_v_t]) --
+                    # averaging first lets velocity shifts of opposite sign at
+                    # different t cancel out, silently shrinking the ratio's
+                    # corrective signal (this was very likely a second,
+                    # compounding cause of delta_v_abs_mean shrinking as
+                    # collapse deepened, on top of the cfm_eps-vs-real-z bug).
+                    # Instead: compute a separate ratio/surrogate at each of
+                    # the cfm_n sampled t's, and only average the final
+                    # per-sample PPO loss -- the correct Monte Carlo estimate
+                    # of E_p(t)[surrogate].
+                    delta_v = v_new_real - v_old_real                # [M,N,cfm_n,A]
+                    n_noise_exp = n_noise.unsqueeze(2).expand_as(delta_v)  # same n for every t
 
                     sigma_new = self.mac.agent.sigma()              # [A], grad-tracked
                     with th.no_grad():
                         sigma_old = self.old_mac.agent.sigma()      # [A], frozen reference
 
                     log_ratio_per_dim = -0.5 * (
-                        (n_noise - delta_v) ** 2 / sigma_new ** 2
-                        - n_noise ** 2 / sigma_old ** 2
+                        (n_noise_exp - delta_v) ** 2 / sigma_new ** 2
+                        - n_noise_exp ** 2 / sigma_old ** 2
                         + th.log(sigma_new ** 2 / sigma_old ** 2)
                     )
-                    log_ratio = log_ratio_per_dim.sum(dim=-1)       # [M,N]
-                    mb_rho_s = th.exp(th.clamp(log_ratio, -rho_clip, rho_clip))
+                    log_ratio = log_ratio_per_dim.sum(dim=-1)       # [M,N,cfm_n]
+                    mb_rho_s_t = th.exp(th.clamp(log_ratio, -rho_clip, rho_clip))
 
+                    mb_advantages_3d = mb_advantages_2d.unsqueeze(2).expand_as(mb_rho_s_t)
+                    surr1 = mb_rho_s_t * mb_advantages_3d
+                    surr2 = th.clamp(
+                        mb_rho_s_t, 1 - self.args.eps_clip, 1 + self.args.eps_clip
+                    ) * mb_advantages_3d
+                    pg_loss = -th.min(surr1, surr2).mean()          # mean over M,N,cfm_n
+
+                    mb_rho_s = mb_rho_s_t.mean(dim=2)               # [M,N], for logging only
                     delta_v_abs_mean = delta_v.detach().abs().mean().item()
                     n_abs_mean = n_noise.detach().abs().mean().item()
                 else:
@@ -296,13 +424,15 @@ class FPOContinuousLearner:
                     mb_rho_s = th.exp(th.clamp(diff_mean, -rho_clip, rho_clip))  # [M,N]
                     delta_v_abs_mean = n_abs_mean = 0.0
 
-                mb_rho_s = mb_rho_s.reshape(-1)
+                    mb_rho_s_flat = mb_rho_s.reshape(-1)
+                    mb_advantages = mb_advantages_2d.reshape(-1)
+                    surr1 = mb_rho_s_flat * mb_advantages
+                    surr2 = th.clamp(
+                        mb_rho_s_flat, 1 - self.args.eps_clip, 1 + self.args.eps_clip
+                    ) * mb_advantages
+                    pg_loss = -th.min(surr1, surr2).mean()
+
                 mb_advantages = mb_advantages_2d.reshape(-1)
-                surr1 = mb_rho_s * mb_advantages
-                surr2 = th.clamp(
-                    mb_rho_s, 1 - self.args.eps_clip, 1 + self.args.eps_clip
-                ) * mb_advantages
-                pg_loss = -th.min(surr1, surr2).mean()
 
                 # Entropy bonus: FPO has no closed-form action distribution to take
                 # log/entropy of, so approximate "how spread out are the actions
@@ -394,6 +524,19 @@ class FPOContinuousLearner:
             self.logger.log_stat(
                 "action_overshoot_at_bound_mean", action_overshoot_at_bound_mean, t_env
             )
+            self.logger.log_stat(
+                "action_noisy_overshoot_mean", action_noisy_overshoot_mean, t_env
+            )
+            self.logger.log_stat(
+                "action_noisy_overshoot_at_bound_mean",
+                action_noisy_overshoot_at_bound_mean,
+                t_env,
+            )
+            self.logger.log_stat(
+                "action_at_bound_from_noise_fraction",
+                action_at_bound_from_noise_fraction,
+                t_env,
+            )
             for key in ["critic_loss", "critic_grad_norm", "td_error_abs",
                         "value_mean", "target_mean"]:
                 self.logger.log_stat(key, self._mean_stat(critic_train_stats[key]), t_env)
@@ -459,6 +602,17 @@ class FPOContinuousLearner:
         self.mac.init_hidden(batch.batch_size)
         for t in range(batch.max_seq_length - 1):
             h = self.mac.forward(batch, t=t)
+            h_list.append(h)
+        return th.stack(h_list, dim=1)                # [B,T,N,hidden_dim]
+
+    def _build_old_actor_hidden_sequence(self, batch: EpisodeBatch) -> th.Tensor:
+        """Same as _build_actor_hidden_sequence but through old_mac's own
+        (frozen) encoder -- required for any v_old(...) call to be a genuine
+        "what would the old policy have output" evaluation."""
+        h_list = []
+        self.old_mac.init_hidden(batch.batch_size)
+        for t in range(batch.max_seq_length - 1):
+            h = self.old_mac.forward(batch, t=t)
             h_list.append(h)
         return th.stack(h_list, dim=1)                # [B,T,N,hidden_dim]
 

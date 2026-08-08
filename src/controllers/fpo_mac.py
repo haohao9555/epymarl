@@ -51,10 +51,11 @@ class FPOMAC:
                 self._last_noise,
             ) = self.agent.sample_action(inputs, self.hidden_states)
 
-        # action / x1_raw / noise: [B*N, n_actions] → [B, N, n_actions]
+        # action / x1_raw / noise / eps: [B*N, n_actions] → [B, N, n_actions]
         action = action.view(B, self.n_agents, -1)
         self._last_x1_raw = self._last_x1_raw.view(B, self.n_agents, -1)
         self._last_noise = self._last_noise.view(B, self.n_agents, -1)
+        self._last_eps = self._last_eps.view(B, self.n_agents, -1)
         return action[bs]
 
     # ── learner forward（返回 h 供 CFM loss 计算）────────────────────────────
