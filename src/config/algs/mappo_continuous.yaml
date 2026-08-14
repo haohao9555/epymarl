@@ -40,4 +40,10 @@ wandb_mode: "online"
 beta_param_epsilon: 0.05
 beta_action_epsilon: 0.000001
 
+# Best-effort evaluation recordings. Recording failures are logged and skipped.
+record_mov: True
+record_mov_interval: 500000
+record_mov_timesteps: []
+record_mov_fps: 5
+
 t_max: 20050000

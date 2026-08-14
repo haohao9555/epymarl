@@ -14,11 +14,12 @@ class FPOActor(nn.Module):
         [h, x_t, t] → vel_fc1 → ReLU → vel_fc2 → velocity
 
     rollout 采样（K 步 Euler，从 t=0 积分到 t=1，K = args.cfm_rollout_steps）：
-        x_0 = eps ~ Uniform(0,1)
+        x_0 = eps ~ N(0,I)
         x_{t+dt} = x_t + dt * v(h, x_t, t)
-        action = clamp(x_1 + n, 0, 1)，n ~ N(0, sigma^2)（PolicyFlow 风格的
-                 可学习末端噪声，见 sigma()；仅在非 test_mode 下叠加）
-    训练 CFM   : cfm_loss = ||v(h, x_t, t) - (action - eps)||²
+        action = sigmoid(x_1 + n)，n ~ N(0, sigma^2)（PolicyFlow 风格的可学习末端
+                 噪声，见 sigma()；仅在非 test_mode 下叠加。全程无界 latent 空间，
+                 sigmoid 是唯一映射进 (0,1) 的一步，取代原来的 hard clamp）
+    训练 CFM   : cfm_loss = ||v(h, x_t, t) - (action_raw - eps)||²
     """
 
     def __init__(self, input_shape, args):
@@ -42,19 +43,37 @@ class FPOActor(nn.Module):
         # 连续 PPO 的 log_std 做法)。sigma() 同时用于: (a) rollout 时在积分
         # 终点叠加真正的探索噪声，(b) Brownian regularizer 里的高斯熵项
         # w_g * H[N(0,sigma^2)]——sigma 必须真正参与采样，这个熵项才不是摆设。
-        # 初始化到 sigma≈sigma_init(默认 0.1)而不是 exp(0)=1.0：动作范围只有
-        # [0,1] 宽，sigma=1.0 这么大的噪声叠加 clamp 会人为制造出贴边质量(等
-        # 价于 truncated Gaussian 在窄区间上的两端堆积)，训练早期
-        # action_at_bound_fraction 虚高就是这个人为假象，不是 velocity 场本身
-        # 塌缩——sigma_init 给一个和动作范围匹配的起点，避免这段虚高。
+        #
+        # 参数化用 sigma = sigma_min + (sigma_max-sigma_min)*sigmoid(raw_sigma)，
+        # 不用 exp(raw).clamp(min=sigma_min)：后者只有下限、没有上限，实测长跑
+        # (20M 步)里 sigma_mean 从 0.27 一路单调涨到 0.9 都没有平台迹象——超过
+        # 动作范围[0,1]宽度的一半后，噪声本身就足以主导贴边行为(clamp 人为制造
+        # 贴边，跟训练早期 sigma_init 选太大是同一种机制，只是这次是训练过程中
+        # 自己爬上去的，不是初始化的问题)。sigmoid 参数化天然把 sigma 约束在
+        # [sigma_min, sigma_max]，两端梯度平滑趋于 0(饱和特性类似 tanh 限幅
+        # velocity 那次的思路)，不会无限爬升。
         sigma_init = getattr(args, "sigma_init", 0.1)
-        self.log_sigma = nn.Parameter(
-            th.full((n_actions,), th.log(th.tensor(sigma_init)).item())
-        )
+        self.sigma_min = getattr(args, "sigma_min", 0.01)
+        self.sigma_max = getattr(args, "sigma_max", 1.0)
+        # 反解初始化: sigmoid(raw_init) = (sigma_init-sigma_min)/(sigma_max-sigma_min)
+        p_init = (sigma_init - self.sigma_min) / (self.sigma_max - self.sigma_min)
+        p_init = min(max(p_init, 1e-4), 1 - 1e-4)  # 避免 logit 在 0/1 处发散
+        raw_init = th.log(th.tensor(p_init) / (1 - th.tensor(p_init))).item()
+        self.raw_sigma = nn.Parameter(th.full((n_actions,), raw_init))
 
     def sigma(self):
-        sigma_min = getattr(self.args, "sigma_min", 0.01)
-        return th.exp(self.log_sigma).clamp(min=sigma_min)
+        # 诊断用逃生舱: sigma_fixed_value 设置后直接返回常数，完全不碰
+        # self.raw_sigma——不进计算图，梯度出不去、也进不来。用来隔离"σ数值
+        # 大小"和"σ在训练中漂移"这两件事：固定在不同常数下对比
+        # oscillation_fraction，纯粹看数值大小的影响，不涉及学习动态。
+        fixed = getattr(self.args, "sigma_fixed_value", None)
+        if fixed is not None:
+            return th.full(
+                (self.args.n_actions,), float(fixed), device=self.raw_sigma.device
+            )
+        return self.sigma_min + (self.sigma_max - self.sigma_min) * th.sigmoid(
+            self.raw_sigma
+        )
 
     def init_hidden(self):
         return self.fc1.weight.new(1, self.args.hidden_dim).zero_()
@@ -139,29 +158,41 @@ class FPOActor(nn.Module):
     def sample_action(self, inputs, hidden_state):
         """K 步 flow 采样。
 
-        x_0 = eps ~ Uniform(0,1)  (基分布改成 Uniform，跟 action 本身同一个区间)
-        action = clamp(integrate(h, eps, K), 0, 1)
+        x_0 = eps ~ N(0,I)  (基分布，跟 action 本身的 [0,1] 区间无关——z 的分布
+                 形状本身对 ratio 的可算性没有影响，因为 z 不依赖网络参数 θ，
+                 会在 old/new policy 的 ratio 里精确抵消掉；见 2026-08-13 对话
+                 记录的推导。换成高斯是更贴近 rectified flow / stochastic
+                 interpolant 文献里的标准约定)
+        u = integrate(h, eps, K) + n,  n ~ N(0, sigma^2)   (全程无界 latent 空间)
+        action = sigmoid(u)                                (唯一一步映射进 (0,1))
+
+        用 sigmoid 代替 hard clamp：之前 action = clamp(x1+n, 0, 1) 有个隐藏的
+        模型失配——ratio 把 n 当成未截断的高斯来算似然，但真实执行的动作是截断
+        过的，两者在贴边样本上对不上。换成 sigmoid 后，x1、n、u = x1+n 全程都在
+        无界实数空间，n 就是货真价实、从未被截断过的高斯噪声，ratio 对 u 算出
+        来的似然是精确的，不再有这个失配。sigmoid 是固定、不含参数的变换，同一
+        个 u 在 new/old policy 下经过的是同一个 sigmoid，其雅可比在 ratio 里精确
+        抵消，所以现有的 ratio 公式（对 n 和 Δv 算）不需要因为这个改动而改变。
 
         返回: (action, h, eps, x1_raw, noise)
-            action: [..., n_actions]  实际执行的动作（已 clamp(x1+noise, 0, 1)）
+            action: [..., n_actions]  实际执行的动作（sigmoid(x1+noise)，∈(0,1)，
+                    永远不会真正等于 0/1，只会渐近逼近）
             h:      [..., hidden_dim] 更新后的 hidden state
-            eps:    [..., n_actions]  本次采样的噪声（供 initial_cfm_loss 用）
-            x1_raw: [..., n_actions]  clamp 之前的积分终点 phi_hat，用于诊断"贴边是
-                    刚好压线还是冲出界很远被硬拉回来"，也是训练插值的目标端点
-            noise:  [..., n_actions]  真实采样的高斯噪声 n ~ N(0,sigma^2)，必须单独
-                    存下来——clamp 之后的 action 一旦真的被截断过，就没法用
-                    action-x1_raw 反推出这个 n 了（截断后的差值已经不是真正的高
-                    斯样本），PolicyFlow ratio 需要的是这个未经改动的 n 本身。
+            eps:    [..., n_actions]  本次采样的基分布噪声（供 initial_cfm_loss 用）
+            x1_raw: [..., n_actions]  sigmoid 之前的积分终点 phi_hat（无界 latent，
+                    不再是"该落在[0,1]、有时候越界"的量，是训练插值的目标端点）
+            noise:  [..., n_actions]  真实采样的高斯噪声 n ~ N(0,sigma^2)，PolicyFlow
+                    ratio 需要的就是这个未经任何变换的 n 本身。
         """
         h = self.encode(inputs, hidden_state)
         n_act = self.args.n_actions
-        eps = th.rand(*h.shape[:-1], n_act, device=h.device)
+        eps = th.randn(*h.shape[:-1], n_act, device=h.device)
         n_steps = getattr(self.args, "cfm_rollout_steps", 1)
         x1 = self.integrate(h, eps, n_steps)
-        # PolicyFlow 风格：flow 积分终点叠加可学习的高斯噪声 a = x1 + n，
+        # PolicyFlow 风格：flow 积分终点叠加可学习的高斯噪声 u = x1 + n，
         # n ~ N(0, sigma^2)，让 sigma 真正参与探索，而不只是个装饰参数。
         noise = th.randn_like(x1) * self.sigma()
-        action = th.clamp(x1 + noise, 0.0, 1.0)
+        action = th.sigmoid(x1 + noise)
         return action, h, eps, x1, noise
 
 #-----------------------------

@@ -94,6 +94,127 @@ class PPOContinuousLearner:
         u_shaped = ((alpha_all < 1.0) & (beta_all < 1.0)).float()
         u_shaped_fraction = (u_shaped * act_mask).sum() / act_mask_sum
 
+        # Behavioral-pattern diagnostics ported unchanged from
+        # fpo_continuous_learner.py (same thresholds/definitions), so MAFPO
+        # and MAPPO's wandb curves are directly comparable on: net-force
+        # magnitude (MPE opposing-pair encoding), distance-to-nearest-landmark
+        # conditioned speed (far+fast / near+slow / near+still-fast), and
+        # consecutive-step direction-flip oscillation. Beta samples `actions`
+        # are already the final executed action (no separate raw/noise split
+        # the way FPO has), so there's no phi-only counterpart here.
+        if self.n_actions >= 5:
+            force_x = actions[..., 2] - actions[..., 1]      # [B,T,N]
+            force_y = actions[..., 4] - actions[..., 3]
+            force_valid = mask.bool()
+            valid_fx = force_x[force_valid]
+            valid_fy = force_y[force_valid]
+            if valid_fx.numel() > 0:
+                force_mag = th.sqrt(valid_fx ** 2 + valid_fy ** 2)
+                force_x_mean = valid_fx.mean().item()
+                force_y_mean = valid_fy.mean().item()
+                force_magnitude_mean = force_mag.mean().item()
+                force_near_zero_fraction = (force_mag < 0.1).float().mean().item()
+                force_near_max_fraction = (force_mag > 0.9).float().mean().item()
+            else:
+                force_x_mean = force_y_mean = force_magnitude_mean = 0.0
+                force_near_zero_fraction = force_near_max_fraction = 0.0
+
+            # Per-agent breakdown and per-timestep same-action fraction,
+            # ported unchanged from fpo_continuous_learner.py -- see there
+            # for the full rationale (divergence across agents vs. collapse
+            # to a shared behavior, since obs_agent_id is supposed to let
+            # one shared network act differently per agent).
+            per_agent_fx, per_agent_fy = [], []
+            for i in range(self.n_agents):
+                agent_mask = mask[..., i].bool()
+                fx_i = force_x[..., i][agent_mask]
+                fy_i = force_y[..., i][agent_mask]
+                per_agent_fx.append(fx_i.mean().item() if fx_i.numel() > 0 else 0.0)
+                per_agent_fy.append(fy_i.mean().item() if fy_i.numel() > 0 else 0.0)
+            force_x_agent_std = float(th.tensor(per_agent_fx).std(unbiased=False))
+            force_y_agent_std = float(th.tensor(per_agent_fy).std(unbiased=False))
+
+            still_thresh = 0.15
+            is_still = (force_x.abs() < still_thresh) & (force_y.abs() < still_thresh)
+            x_dominant = force_x.abs() >= force_y.abs()
+            # category ids: 0=still, 1=+x, 2=-x, 3=+y, 4=-y
+            category = th.zeros_like(force_x, dtype=th.long)
+            category = th.where(is_still, th.zeros_like(category), category)
+            moving = ~is_still
+            category = th.where(moving & x_dominant & (force_x > 0), th.full_like(category, 1), category)
+            category = th.where(moving & x_dominant & (force_x <= 0), th.full_like(category, 2), category)
+            category = th.where(moving & (~x_dominant) & (force_y > 0), th.full_like(category, 3), category)
+            category = th.where(moving & (~x_dominant) & (force_y <= 0), th.full_like(category, 4), category)
+
+            step_valid = mask[..., 0].bool()                          # [B,T]
+            cat_onehot = th.nn.functional.one_hot(category, num_classes=5)  # [B,T,N,5]
+            cat_counts = cat_onehot.sum(dim=2)                        # [B,T,5]
+            max_count = cat_counts.amax(dim=-1)                       # [B,T]
+            valid_max_count = max_count[step_valid]
+            if valid_max_count.numel() > 0:
+                agents_same_action_fraction = (
+                    (valid_max_count >= 2).float().mean().item()
+                )
+                agents_all_same_action_fraction = (
+                    (valid_max_count >= self.n_agents).float().mean().item()
+                )
+            else:
+                agents_same_action_fraction = agents_all_same_action_fraction = 0.0
+
+            if "obs" in batch.scheme:
+                n_landmarks = getattr(self.args, "n_landmarks", self.n_agents)
+                obs = batch["obs"][:, :-1].float()
+                landmark_end = 4 + 2 * n_landmarks
+                if obs.shape[-1] >= landmark_end:
+                    landmark_rel = obs[..., 4:landmark_end].reshape(
+                        *obs.shape[:-1], n_landmarks, 2
+                    )
+                    nearest_dist = landmark_rel.norm(dim=-1).min(dim=-1)[0]
+
+                    far_thresh = getattr(self.args, "landmark_far_thresh", 0.3)
+                    near_thresh = getattr(self.args, "landmark_near_thresh", 0.15)
+                    force_mag_full = th.sqrt(force_x ** 2 + force_y ** 2)
+                    is_far = nearest_dist > far_thresh
+                    is_near = nearest_dist < near_thresh
+                    is_fast = force_mag_full > 0.7
+                    is_slow = force_mag_full < 0.3
+                    step_agent_valid = mask.bool()
+                    denom = step_agent_valid.float().sum()
+
+                    def _frac(cond):
+                        return (
+                            (cond & step_agent_valid).float().sum() / denom
+                        ).item() if denom > 0 else 0.0
+
+                    far_fast_fraction = _frac(is_far & is_fast)
+                    near_slow_fraction = _frac(is_near & is_slow)
+                    near_still_fast_fraction = _frac(is_near & is_fast)
+
+                    fx_prev, fx_curr = force_x[:, :-1], force_x[:, 1:]
+                    fy_prev, fy_curr = force_y[:, :-1], force_y[:, 1:]
+                    mag_prev = th.sqrt(fx_prev ** 2 + fy_prev ** 2)
+                    mag_curr = th.sqrt(fx_curr ** 2 + fy_curr ** 2)
+                    dot = fx_prev * fx_curr + fy_prev * fy_curr
+                    pair_valid = mask[:, :-1].bool() & mask[:, 1:].bool()
+                    is_flip = (mag_prev > 0.5) & (mag_curr > 0.5) & (dot < 0)
+                    denom_pairs = pair_valid.float().sum()
+                    oscillation_fraction = (
+                        (is_flip & pair_valid).float().sum() / denom_pairs
+                    ).item() if denom_pairs > 0 else 0.0
+                else:
+                    far_fast_fraction = near_slow_fraction = 0.0
+                    near_still_fast_fraction = oscillation_fraction = 0.0
+            else:
+                far_fast_fraction = near_slow_fraction = 0.0
+                near_still_fast_fraction = oscillation_fraction = 0.0
+        else:
+            force_x_mean = force_y_mean = force_magnitude_mean = 0.0
+            force_near_zero_fraction = force_near_max_fraction = 0.0
+            force_x_agent_std = force_y_agent_std = 0.0
+            agents_same_action_fraction = agents_all_same_action_fraction = 0.0
+            far_fast_fraction = near_slow_fraction = 0.0
+            near_still_fast_fraction = oscillation_fraction = 0.0
+
         for _ in range(self.args.epochs):
             mac_out = []
             self.mac.init_hidden(batch.batch_size)
@@ -203,6 +324,31 @@ class PPOContinuousLearner:
             self.logger.log_stat("alpha_mean", alpha_mean.item(), t_env)
             self.logger.log_stat("beta_mean", beta_mean.item(), t_env)
             self.logger.log_stat("u_shaped_fraction", u_shaped_fraction.item(), t_env)
+            self.logger.log_stat("force_x_mean", force_x_mean, t_env)
+            self.logger.log_stat("force_y_mean", force_y_mean, t_env)
+            self.logger.log_stat("force_magnitude_mean", force_magnitude_mean, t_env)
+            self.logger.log_stat("force_x_agent_std", force_x_agent_std, t_env)
+            self.logger.log_stat("force_y_agent_std", force_y_agent_std, t_env)
+            self.logger.log_stat(
+                "agents_same_action_fraction", agents_same_action_fraction, t_env
+            )
+            self.logger.log_stat(
+                "agents_all_same_action_fraction",
+                agents_all_same_action_fraction,
+                t_env,
+            )
+            self.logger.log_stat(
+                "force_near_zero_fraction", force_near_zero_fraction, t_env
+            )
+            self.logger.log_stat(
+                "force_near_max_fraction", force_near_max_fraction, t_env
+            )
+            self.logger.log_stat("far_fast_fraction", far_fast_fraction, t_env)
+            self.logger.log_stat("near_slow_fraction", near_slow_fraction, t_env)
+            self.logger.log_stat(
+                "near_still_fast_fraction", near_still_fast_fraction, t_env
+            )
+            self.logger.log_stat("oscillation_fraction", oscillation_fraction, t_env)
             self.log_stats_t = t_env
 
     def train_critic_sequential(self, critic, target_critic, batch, rewards, mask):

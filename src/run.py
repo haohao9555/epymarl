@@ -196,18 +196,37 @@ def run_sequential(args, logger):
     if args.runner == "fpo_episode" or args.learner in ("fpo_learner", "fpo_continuous_learner", "fpo_discrete_learner"):
         args.cfm_n_samples = getattr(args, "cfm_n_samples", 1)
         args.cfm_action_dim = getattr(args, "cfm_action_dim", args.n_actions)
-        scheme["cfm_eps"] = {
-            "vshape": (args.cfm_n_samples, args.cfm_action_dim),
-            "group": "agents",
-        }
-        scheme["cfm_t"] = {
-            "vshape": (args.cfm_n_samples, 1),
-            "group": "agents",
-        }
-        scheme["initial_cfm_loss"] = {
-            "vshape": (args.cfm_n_samples, 1),
-            "group": "agents",
-        }
+
+        # cfm_eps/cfm_t/initial_cfm_loss are the OLD FPO ratio mechanism's own
+        # neighbourhood-probe fields (cfm-loss-difference ratio, see
+        # fpo_continuous_learner's class docstring). The active PolicyFlow
+        # ratio (use_policyflow_ratio=True, continuous learner only) never
+        # reads any of them -- delta_v and brownian_loss are both built from
+        # the real rollout z/action_raw below and a t-grid computed at train
+        # time, not stored per-timestep. Skipping construction here saves a
+        # rollout-time velocity() call per (env-step, cfm_n sample), buffer
+        # memory, and multiprocessing transfer -- see parallel_runner.py's
+        # collect_cfm flag, which is driven entirely by whether these keys
+        # are present in the scheme. Still needed for fpo_discrete_learner/
+        # fpo_learner and for the continuous learner's old-ratio fallback
+        # (use_policyflow_ratio=False).
+        use_pf_ratio = (
+            args.learner == "fpo_continuous_learner"
+            and getattr(args, "use_policyflow_ratio", False)
+        )
+        if not use_pf_ratio:
+            scheme["cfm_eps"] = {
+                "vshape": (args.cfm_n_samples, args.cfm_action_dim),
+                "group": "agents",
+            }
+            scheme["cfm_t"] = {
+                "vshape": (args.cfm_n_samples, 1),
+                "group": "agents",
+            }
+            scheme["initial_cfm_loss"] = {
+                "vshape": (args.cfm_n_samples, 1),
+                "group": "agents",
+            }
         # Pre-clamp integration endpoint, for diagnosing whether actions pinned
         # at the [0,1] boundary are just-barely-there or wildly overshooting.
         scheme["action_raw"] = {
@@ -312,7 +331,15 @@ def run_sequential(args, logger):
 
     logger.console_logger.info("Beginning training for {} timesteps".format(args.t_max))
     record_mov_enabled = _record_mov_available(args, logger)
-    record_mov_steps = sorted(int(t) for t in getattr(args, "record_mov_timesteps", []))
+    record_mov_steps = {
+        int(t) for t in getattr(args, "record_mov_timesteps", []) if int(t) > 0
+    }
+    record_mov_interval = int(getattr(args, "record_mov_interval", 0))
+    if record_mov_interval > 0:
+        record_mov_steps.update(
+            range(record_mov_interval, int(args.t_max) + 1, record_mov_interval)
+        )
+    record_mov_steps = sorted(record_mov_steps)
     recorded_mov_steps = set()
 
     is_fpo_transition_batch = args.learner in ("fpo_continuous_learner", "fpo_discrete_learner")
@@ -368,12 +395,19 @@ def run_sequential(args, logger):
             ]
             for record_step in due_steps:
                 record_path = _next_record_path(args, record_step)
-                logger.console_logger.info(
-                    "Recording evaluation episode at %s steps to %s",
-                    record_step,
-                    record_path,
-                )
-                runner.run(test_mode=True, record_path=record_path)
+                try:
+                    logger.console_logger.info(
+                        "Recording evaluation episode at %s steps to %s",
+                        record_step,
+                        record_path,
+                    )
+                    runner.run(test_mode=True, record_path=record_path)
+                except Exception as exc:
+                    logger.console_logger.warning(
+                        "Recording failed at %s steps; continuing training: %s",
+                        record_step,
+                        exc,
+                    )
                 recorded_mov_steps.add(record_step)
 
         # Execute test runs once in a while

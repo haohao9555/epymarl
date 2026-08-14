@@ -162,9 +162,15 @@ class EpisodeRunner:
         if record_path is None:
             return
         try:
-            frame = self.env.render(mode="rgb_array")
-        except TypeError:
-            frame = self.env.render()
+            try:
+                frame = self.env.render(mode="rgb_array")
+            except TypeError:
+                frame = self.env.render()
+        except Exception as exc:
+            self.logger.console_logger.warning(
+                "Failed to capture recording frame; skipping frame: %s", exc
+            )
+            return
         if frame is not None:
             frames.append(frame)
 

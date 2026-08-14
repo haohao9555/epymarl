@@ -29,19 +29,27 @@ class FPOMAC:
         B = ep_batch.batch_size
 
         if test_mode:
-            # 确定性评估：用 eps=0.5（Uniform(0,1) 的中心）而不是重新随机采样，
+            # 确定性评估：用 eps=0（N(0,I) 的中心/均值）而不是重新随机采样，
             # 与 BetaActionSelector 在 test_mode 下返回分布均值而非 sample() 的约定一致
             # （见 components/action_selectors.py 的 BetaActionSelector）。
             h = self.agent.encode(inputs, self.hidden_states)
             self.hidden_states = h
             n_act = self.args.n_actions
-            eps = th.full((*h.shape[:-1], n_act), 0.5, device=h.device)
+            eps = th.zeros((*h.shape[:-1], n_act), device=h.device)
             n_steps = getattr(self.args, "cfm_rollout_steps", 1)
             x1 = self.agent.integrate(h, eps, n_steps)
-            action = th.clamp(x1, 0.0, 1.0)
+            # test_add_noise: diagnostic-only flag to answer "if the same
+            # exploration noise used at rollout were also applied at eval,
+            # would return collapse?" -- default False (normal noise-free
+            # eval, matches test_return_mean's usual meaning).
+            if getattr(self.args, "test_add_noise", False):
+                noise = th.randn_like(x1) * self.agent.sigma()
+            else:
+                noise = th.zeros_like(x1)
+            action = th.sigmoid(x1 + noise)
             self._last_eps = eps
             self._last_x1_raw = x1
-            self._last_noise = th.zeros_like(x1)   # 确定性评估不加噪声
+            self._last_noise = noise
         else:
             (
                 action,

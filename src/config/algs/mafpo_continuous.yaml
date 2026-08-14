@@ -26,10 +26,14 @@ cfm_target_type: "velocity"
 # Bound the velocity network's output to [-cfm_velocity_bound, cfm_velocity_bound]
 # via tanh. Without this, gradient ascent on cfm_loss for advantage<0 samples has
 # no ceiling and the output-layer weights diverge over long training runs.
-# Noise base is Uniform(0,1) now (see fpo_actor.py), so target=action-eps has
-# natural range [-1,1] instead of [-4,4] under a Gaussian base — 1.5 keeps a
-# comfortable margin over that tighter range.
-cfm_velocity_bound: 1.5
+# Base distribution switched back to N(0,I) (2026-08-13, see fpo_actor.py),
+# so target=action-eps has natural range ~[-4,4] again (eps can reach ~±3),
+# not the tighter [-1,1] under Uniform(0,1) that justified tightening this to
+# 1.5. Restored to the pre-Uniform historical default (8.0, was also the
+# function's own getattr fallback) to keep enough margin -- 1.5 would be too
+# tight here and risks re-triggering the tanh-saturation bug (v_new/v_old
+# both saturating identically, killing delta_v's corrective signal).
+cfm_velocity_bound: 8.0
 # Diagnostic-only escape hatch: set False to test whether the bound is still
 # needed once use_policyflow_ratio replaces the old cfm-loss-diff ratio it was
 # originally added for. Leave True for real runs.
@@ -138,6 +142,31 @@ sigma_min: 0.01
 # Trying a middle ground between 1.0 (too flat, manufactures boundary mass)
 # and 0.1 (too sharp, gradient blows up).
 sigma_init: 0.3
+# sigma_max: hard ceiling via sigmoid parametrization (see fpo_actor.sigma()).
+# Without this, sigma_mean climbed unboundedly over a 20M-step run (0.27 ->
+# 0.9+, still rising, no plateau) -- past ~0.5 (half the [0,1] action range)
+# the noise itself starts dominating boundary-pinning behavior regardless of
+# what the flow's own output does. Capping at the full action-range width.
+sigma_max: 1.0
+
+# Diagnostic-only escape hatch: when set (not null), fpo_actor.sigma() returns
+# this constant directly, bypassing raw_sigma/sigma_min/sigma_max/sigmoid
+# entirely -- sigma never enters the computation graph, so it can't move
+# during training regardless of w_g. Used to separate "does oscillation_fraction
+# track sigma's raw magnitude" from "does it track sigma changing/drifting
+# over training" -- compare sigma_fixed_value=0.1 vs 0.5 runs directly on
+# oscillation_fraction (and its phi-only counterpart), no need to look at
+# return for this comparison. Default null (normal learnable sigma).
+sigma_fixed_value: null
+
+# Diagnostic-only: when True, test_mode evaluation also adds the learned
+# sigma noise on top of the deterministic flow endpoint (still logged under
+# test_return_mean, still uses the fixed eps=0.5 test path -- only the
+# noise-injection step changes). Lets test_return_mean be compared directly
+# against a matched noise-free run to isolate exploration noise's true cost
+# to performance, separate from whatever the deterministic policy phi itself
+# has learned. Default False (normal noise-free eval).
+test_add_noise: False
 
 # Replace rho_s = exp(clamp(L_old-L_new,...)) (cfm-loss-difference proxy) with
 # an exact Gaussian importance ratio treating the policy as
@@ -152,5 +181,11 @@ wandb_team: "adolf9555-university-of-technology-sydney"
 wandb_project: "MPE continuous algorithm"
 wandb_run_name: "MAFPO-MPE"
 wandb_mode: "online"
+
+# Best-effort evaluation recordings. Recording failures are logged and skipped.
+record_mov: True
+record_mov_interval: 500000
+record_mov_timesteps: []
+record_mov_fps: 5
 
 t_max: 20050000

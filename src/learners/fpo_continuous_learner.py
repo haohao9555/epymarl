@@ -115,6 +115,166 @@ class FPOContinuousLearner:
         else:
             action_mean = action_std = action_at_bound_fraction = 0.0
 
+        # Net-force diagnostic (pz-mpe-simple-spread specific): the 5-dim
+        # continuous action isn't 5 independent controls -- MPE's own physics
+        # (pettingzoo/mpe/_mpe_utils/simple_env.py) computes
+        #   force_x = action[2] - action[1]
+        #   force_y = action[4] - action[3]
+        # (index 0 is a no-op slot). Two opposing dims pinned at the SAME
+        # boundary (both 0 or both 1) cancel to zero net force -- functionally
+        # identical to both sitting at 0.5 -- while one at each extreme is
+        # full-throttle bang-bang control, not noise. Per-dimension
+        # action_at_bound_fraction can't tell these apart; this can.
+        if self.n_actions >= 5:
+            force_x = actions_taken[..., 2] - actions_taken[..., 1]   # [B,T,N]
+            force_y = actions_taken[..., 4] - actions_taken[..., 3]
+            force_valid = mask.bool()                                # [B,T,N], same shape
+            valid_fx = force_x[force_valid]
+            valid_fy = force_y[force_valid]
+            if valid_fx.numel() > 0:
+                force_mag = th.sqrt(valid_fx ** 2 + valid_fy ** 2)
+                force_x_mean = valid_fx.mean().item()
+                force_y_mean = valid_fy.mean().item()
+                force_magnitude_mean = force_mag.mean().item()
+                # "full-throttle": net force magnitude near its max of sqrt(2)
+                # (both axes maxed) or near 1 (one axis maxed) -- i.e. genuine
+                # bang-bang, not two opposing dims cancelling near 0.
+                force_near_zero_fraction = (force_mag < 0.1).float().mean().item()
+                force_near_max_fraction = (force_mag > 0.9).float().mean().item()
+            else:
+                force_x_mean = force_y_mean = force_magnitude_mean = 0.0
+                force_near_zero_fraction = force_near_max_fraction = 0.0
+
+            # Per-agent breakdown: are different agents pushing in DIFFERENT
+            # directions (healthy -- e.g. each heading to its own landmark),
+            # or is everyone pinned to the same direction at once (a more
+            # degenerate collapse, since obs_agent_id is supposed to let one
+            # shared network act differently per agent)? force_x_mean/
+            # force_y_mean above are pooled across agents and can't tell
+            # these apart -- a high per-agent std here means agents diverge,
+            # near-zero means they're all doing the same thing.
+            per_agent_fx, per_agent_fy = [], []
+            for i in range(self.n_agents):
+                agent_mask = mask[..., i].bool()
+                fx_i = force_x[..., i][agent_mask]
+                fy_i = force_y[..., i][agent_mask]
+                per_agent_fx.append(fx_i.mean().item() if fx_i.numel() > 0 else 0.0)
+                per_agent_fy.append(fy_i.mean().item() if fy_i.numel() > 0 else 0.0)
+            force_x_agent_std = float(th.tensor(per_agent_fx).std(unbiased=False))
+            force_y_agent_std = float(th.tensor(per_agent_fy).std(unbiased=False))
+
+            # Per-TIMESTEP agent-similarity, by DIRECTION CATEGORY not raw
+            # distance: "agent1 moving down (or still), agent2 also moving
+            # down (or still) at this same instant" should count as "same
+            # action" regardless of exact force magnitude -- a continuous
+            # distance threshold conflates "same direction, different speed"
+            # with "different direction", which isn't what we want to catch.
+            # 5 categories: still (force magnitude below still_thresh), or
+            # the sign of whichever axis has bigger magnitude (+x/-x/+y/-y).
+            # This directly answers "are agents collapsing to the same
+            # behavior at the same time" (a shared-parameter-network failure
+            # mode), as opposed to the earlier window-averaged force_x_agent*
+            # stats, which can hide this behind time-varying averages that
+            # happen to cancel out.
+            still_thresh = 0.15
+            is_still = (force_x.abs() < still_thresh) & (force_y.abs() < still_thresh)
+            x_dominant = force_x.abs() >= force_y.abs()
+            # category ids: 0=still, 1=+x, 2=-x, 3=+y, 4=-y
+            category = th.zeros_like(force_x, dtype=th.long)
+            category = th.where(is_still, th.zeros_like(category), category)
+            moving = ~is_still
+            category = th.where(moving & x_dominant & (force_x > 0), th.full_like(category, 1), category)
+            category = th.where(moving & x_dominant & (force_x <= 0), th.full_like(category, 2), category)
+            category = th.where(moving & (~x_dominant) & (force_y > 0), th.full_like(category, 3), category)
+            category = th.where(moving & (~x_dominant) & (force_y <= 0), th.full_like(category, 4), category)
+
+            step_valid = mask[..., 0].bool()                          # [B,T]
+            # For each timestep, how many of the 5 categories are actually
+            # occupied, and does the majority category cover >=2 / all N agents?
+            cat_onehot = th.nn.functional.one_hot(category, num_classes=5)  # [B,T,N,5]
+            cat_counts = cat_onehot.sum(dim=2)                        # [B,T,5]
+            max_count = cat_counts.amax(dim=-1)                       # [B,T], size of largest same-category group
+            valid_max_count = max_count[step_valid]
+            if valid_max_count.numel() > 0:
+                agents_same_action_fraction = (
+                    (valid_max_count >= 2).float().mean().item()
+                )
+                agents_all_same_action_fraction = (
+                    (valid_max_count >= self.n_agents).float().mean().item()
+                )
+            else:
+                agents_same_action_fraction = agents_all_same_action_fraction = 0.0
+
+            # Distance-to-target-conditioned behavior (pz-mpe-simple-spread
+            # specific): correlate force with how close the agent currently
+            # is to its nearest landmark, to distinguish qualitatively
+            # different reasons behind a high action_at_bound_fraction:
+            #   far + full force        -> reasonable (racing toward target)
+            #   near + low force        -> not a real collapse (settled)
+            #   near + still full force -> imprecise control near the goal
+            #   force flips direction every other step -> oscillation
+            # obs layout (pettingzoo/mpe/simple_spread):
+            #   [self_vel(2), self_pos(2), landmark_rel_pos(2*n_landmarks),
+            #    other_agent_rel_pos(2*(N-1)), comm(...)]
+            if "obs" in batch.scheme:
+                n_landmarks = getattr(self.args, "n_landmarks", self.n_agents)
+                obs = batch["obs"][:, :-1].float()                # [B,T,N,obs_dim]
+                landmark_end = 4 + 2 * n_landmarks
+                if obs.shape[-1] >= landmark_end:
+                    landmark_rel = obs[..., 4:landmark_end].reshape(
+                        *obs.shape[:-1], n_landmarks, 2
+                    )
+                    nearest_dist = landmark_rel.norm(dim=-1).min(dim=-1)[0]  # [B,T,N]
+
+                    far_thresh = getattr(self.args, "landmark_far_thresh", 0.3)
+                    near_thresh = getattr(self.args, "landmark_near_thresh", 0.15)
+                    force_mag_full = th.sqrt(force_x ** 2 + force_y ** 2)  # [B,T,N]
+                    is_far = nearest_dist > far_thresh
+                    is_near = nearest_dist < near_thresh
+                    is_fast = force_mag_full > 0.7
+                    is_slow = force_mag_full < 0.3
+                    step_agent_valid = mask.bool()                 # [B,T,N]
+                    denom = step_agent_valid.float().sum()
+
+                    def _frac(cond):
+                        return (
+                            (cond & step_agent_valid).float().sum() / denom
+                        ).item() if denom > 0 else 0.0
+
+                    far_fast_fraction = _frac(is_far & is_fast)
+                    near_slow_fraction = _frac(is_near & is_slow)
+                    near_still_fast_fraction = _frac(is_near & is_fast)
+
+                    # Oscillation: force direction flips between consecutive
+                    # timesteps while BOTH steps are still near-max magnitude
+                    # -- actively slamming between extremes, not just varying
+                    # speed smoothly.
+                    fx_prev, fx_curr = force_x[:, :-1], force_x[:, 1:]
+                    fy_prev, fy_curr = force_y[:, :-1], force_y[:, 1:]
+                    mag_prev = th.sqrt(fx_prev ** 2 + fy_prev ** 2)
+                    mag_curr = th.sqrt(fx_curr ** 2 + fy_curr ** 2)
+                    dot = fx_prev * fx_curr + fy_prev * fy_curr
+                    pair_valid = mask[:, :-1].bool() & mask[:, 1:].bool()
+                    is_flip = (mag_prev > 0.5) & (mag_curr > 0.5) & (dot < 0)
+                    denom_pairs = pair_valid.float().sum()
+                    oscillation_fraction = (
+                        (is_flip & pair_valid).float().sum() / denom_pairs
+                    ).item() if denom_pairs > 0 else 0.0
+                else:
+                    far_fast_fraction = near_slow_fraction = 0.0
+                    near_still_fast_fraction = oscillation_fraction = 0.0
+            else:
+                far_fast_fraction = near_slow_fraction = 0.0
+                near_still_fast_fraction = oscillation_fraction = 0.0
+        else:
+            force_x_mean = force_y_mean = force_magnitude_mean = 0.0
+            force_near_zero_fraction = force_near_max_fraction = 0.0
+            force_x_agent_std = force_y_agent_std = 0.0
+            per_agent_fx = per_agent_fy = []
+            agents_same_action_fraction = agents_all_same_action_fraction = 0.0
+            far_fast_fraction = near_slow_fraction = 0.0
+            near_still_fast_fraction = oscillation_fraction = 0.0
+
         # clamp-前诊断: action_raw 是积分终点在被 clamp(0,1) 之前的原始值。
         # overshoot = 超出 [0,1] 的距离(0 表示压根没超出，本来就在界内)。
         # overshoot_at_bound 只统计"最终落在边界上"的那些样本，看它们原始究竟
@@ -167,15 +327,49 @@ class FPOContinuousLearner:
             action_noisy_overshoot_mean = action_noisy_overshoot_at_bound_mean = 0.0
             action_at_bound_from_noise_fraction = 0.0
 
-        initial_cfm_loss = batch["initial_cfm_loss"][:, :-1]    # [B,T,N,cfm_n,1]
+        # phi-only (noise-free) oscillation: identical flip definition to
+        # oscillation_fraction above, but computed on action_raw (the flow's
+        # own integration endpoint, pre-noise, pre-clamp) instead of the
+        # executed action. Directly separates "is the learned velocity field
+        # itself reversing direction" from "is this just independently
+        # resampled sigma noise creating an apparent flip" -- compare this
+        # against oscillation_fraction side by side rather than assuming
+        # either explanation.
+        if self.n_actions >= 5 and "action_raw" in batch.scheme:
+            force_x_raw = action_raw[..., 2] - action_raw[..., 1]     # [B,T,N]
+            force_y_raw = action_raw[..., 4] - action_raw[..., 3]
+            fx_prev_r, fx_curr_r = force_x_raw[:, :-1], force_x_raw[:, 1:]
+            fy_prev_r, fy_curr_r = force_y_raw[:, :-1], force_y_raw[:, 1:]
+            mag_prev_r = th.sqrt(fx_prev_r ** 2 + fy_prev_r ** 2)
+            mag_curr_r = th.sqrt(fx_curr_r ** 2 + fy_curr_r ** 2)
+            dot_r = fx_prev_r * fx_curr_r + fy_prev_r * fy_curr_r
+            pair_valid_r = mask[:, :-1].bool() & mask[:, 1:].bool()
+            is_flip_r = (mag_prev_r > 0.5) & (mag_curr_r > 0.5) & (dot_r < 0)
+            denom_pairs_r = pair_valid_r.float().sum()
+            oscillation_fraction_phi_only = (
+                (is_flip_r & pair_valid_r).float().sum() / denom_pairs_r
+            ).item() if denom_pairs_r > 0 else 0.0
+        else:
+            oscillation_fraction_phi_only = 0.0
+
         rho_clip = getattr(self.args, "cfm_rho_clip", 3.0)
         entropy_coef = getattr(self.args, "entropy_coef", 0.0)
         entropy_n_samples = getattr(self.args, "entropy_n_samples", 4)
-        lambda_trust = getattr(self.args, "lambda_trust", 0.0)
         w_b = getattr(self.args, "w_b", 0.0)
         w_g = getattr(self.args, "w_g", 0.0)
         use_pf_ratio = getattr(self.args, "use_policyflow_ratio", False)
-        need_v_old = lambda_trust > 0.0 or w_b > 0.0 or use_pf_ratio
+        # initial_cfm_loss only exists in the buffer scheme when NOT using
+        # the PolicyFlow ratio (see run.py's scheme setup) -- the old
+        # cfm-loss-diff ratio's else-branch below is the only reader.
+        initial_cfm_loss = (
+            None if use_pf_ratio else batch["initial_cfm_loss"][:, :-1]
+        )                                                        # [B,T,N,cfm_n,1]
+        # trust_loss (lambda_trust) removed: it was permanently disabled
+        # (lambda_trust=0.0) once the Brownian regularizer took over the same
+        # v_new-vs-v_old role, and its computation was fully short-circuited
+        # to a zero tensor -- dead code, see git history for the removed
+        # mechanism (a plain ||v_new-v_old||^2 penalty, superseded by w_b).
+        need_v_old = w_b > 0.0 or use_pf_ratio
 
         # Minibatches are sampled over environment timesteps. Each selected
         # timestep keeps all agents together, so 2048 rollout timesteps really
@@ -194,7 +388,6 @@ class FPOContinuousLearner:
             "clip_fraction": [],
             "actor_grad_norm": [],
             "entropy_mean": [],
-            "trust_loss": [],
             "brownian_loss": [],
             "gaussian_entropy": [],
             "sigma_mean": [],
@@ -247,34 +440,67 @@ class FPOContinuousLearner:
                 # we reused one full graph across minibatches, later updates
                 # would backprop through stale pre-step parameters.
                 h_seq = self._build_actor_hidden_sequence(batch)
-                mb_cfm_loss, mb_v_new, mb_flat_h, mb_flat_x_t, mb_flat_t = (
-                    self._compute_cfm_loss_for_time_indices(batch, h_seq, mb_time_idx)
-                )
 
-                # Trust-region penalty: keep this round's velocity field close to
-                # the field that generated the rollout, evaluated at the exact
-                # same (x_t, t) points already used for the CFM loss above (but
-                # through old_mac's OWN hidden state -- see old_h_seq comment,
-                # never mb_flat_h, which comes from self.mac's encoder).
-                # Unlike eps_clip (which only gates whether a sample's gradient
-                # fires at all), this is a continuous, always-on pull back toward
-                # last round's policy, directly limiting how far v_pred can drift
-                # per round regardless of advantage sign.
+                # Real-rollout-path (z, action_raw) interpolated at a FIXED,
+                # deterministic t-grid -- shared by both the PolicyFlow
+                # ratio's delta_v and the Brownian regularizer's eta_t below.
+                # Previously these used two DIFFERENT probe paths: delta_v
+                # was fixed to use the real z after finding cfm_eps collapsed
+                # its corrective signal toward 0 (action_at_bound_fraction
+                # climbing to 90%+ while delta_v_abs_mean shrank toward 0 in
+                # a 2M-step run), but brownian_loss was never migrated and
+                # kept evaluating v_new/v_old at cfm_eps-based neighbourhood
+                # points -- the same "unrelated to what actually happened"
+                # problem, just undiscovered in a second place. Unified here.
+                #
+                # t is now a fixed linspace instead of fresh random cfm_t
+                # samples: for a Monte Carlo/quadrature estimate of an
+                # integral over t in [0,1], an even grid has lower variance
+                # than random draws of the same count, and needs no
+                # rollout-time sampling or buffer storage at all (cfm_eps and
+                # cfm_t are no longer read in this branch).
                 if need_v_old:
+                    cfm_n = getattr(self.args, "cfm_n_samples", 10)
+                    z_flat = batch["z"][:, :-1].float().reshape(
+                        -1, self.n_agents, self.n_actions
+                    )
+                    phi_flat = batch["action_raw"][:, :-1].float().reshape(
+                        -1, self.n_agents, self.n_actions
+                    )
+                    mb_z = z_flat[mb_time_idx]                      # [M,N,A]
+                    mb_phi = phi_flat[mb_time_idx]                  # [M,N,A]
+
+                    t_vals = th.linspace(0.0, 1.0, cfm_n + 1, device=mb_z.device)[:-1]
+                    t_grid = t_vals.reshape(1, 1, cfm_n, 1).expand(
+                        mb_z.shape[0], mb_z.shape[1], -1, -1
+                    )                                                # [M,N,cfm_n,1]
+
+                    z_exp = mb_z.unsqueeze(2).expand(-1, -1, cfm_n, -1)
+                    phi_exp = mb_phi.unsqueeze(2).expand(-1, -1, cfm_n, -1)
+                    x_t_real = (1 - t_grid) * z_exp + t_grid * phi_exp   # [M,N,cfm_n,A]
+
+                    h_flat = h_seq.reshape(-1, self.n_agents, h_seq.shape[-1])
+                    mb_h = h_flat[mb_time_idx]                      # [M,N,H]
+                    h_exp_real = mb_h.unsqueeze(2).expand(-1, -1, cfm_n, -1)
+                    flat_h_real = h_exp_real.reshape(-1, h_exp_real.shape[-1])
+                    flat_x_t_real = x_t_real.reshape(-1, x_t_real.shape[-1])
+                    flat_t_real = t_grid.reshape(-1, 1)
+
+                    v_new_real = self.mac.agent.velocity(
+                        flat_h_real, flat_x_t_real, flat_t_real
+                    ).reshape_as(x_t_real)
+
+                    # v_old must go through old_mac's OWN encoder output
+                    # (old_h_seq), never self.mac's h_seq -- see old_h_seq
+                    # comment above the epoch loop.
                     old_h_flat = old_h_seq.reshape(-1, self.n_agents, old_h_seq.shape[-1])
                     mb_old_h = old_h_flat[mb_time_idx]              # [M,N,H]
-                    mb_old_h_exp = mb_old_h.unsqueeze(2).expand(
-                        -1, -1, mb_v_new.shape[2], -1
-                    )
-                    old_flat_h = mb_old_h_exp.reshape(-1, mb_old_h_exp.shape[-1])
+                    old_h_exp_real = mb_old_h.unsqueeze(2).expand(-1, -1, cfm_n, -1)
+                    old_flat_h_real = old_h_exp_real.reshape(-1, old_h_exp_real.shape[-1])
                     with th.no_grad():
-                        v_old = self.old_mac.agent.velocity(
-                            old_flat_h, mb_flat_x_t, mb_flat_t
-                        ).reshape_as(mb_v_new)
-                if lambda_trust > 0.0:
-                    trust_loss = ((mb_v_new - v_old) ** 2).mean()
-                else:
-                    trust_loss = th.zeros((), device=mb_cfm_loss.device)
+                        v_old_real = self.old_mac.agent.velocity(
+                            old_flat_h_real, flat_x_t_real, flat_t_real
+                        ).reshape_as(x_t_real)
 
                 # Brownian regularizer (PolicyFlow, arXiv:2602.01156, Eq.15):
                 # eta_t = (1-t)*v_new - (x_t - t*v_old). Under the rectified-flow
@@ -283,17 +509,21 @@ class FPOContinuousLearner:
                 # the *current* velocity field toward the entropy-increasing
                 # (score-corrected / "Brownian") version of the reference field,
                 # instead of letting it collapse into a purely deterministic map
-                # that concentrates mass at the action boundary. mb_flat_t is
-                # flat [M*N*cfm_n, 1]; v_new/v_old are [M,N,cfm_n,A], so broadcast
-                # t back against them via mb_flat_t's own leading dim.
+                # that concentrates mass at the action boundary.
                 if w_b > 0.0:
-                    t_bcast = mb_flat_t.reshape_as(mb_v_new[..., :1])
-                    eta_t = (1 - t_bcast) * mb_v_new - (
-                        mb_flat_x_t.reshape_as(mb_v_new) - t_bcast * v_old
+                    eta_t = (1 - t_grid) * v_new_real - (
+                        x_t_real - t_grid * v_old_real
                     )
-                    brownian_loss = (eta_t ** 2).mean()
+                    # ||eta_t||^2 is a squared L2 norm -- SUM over the action
+                    # dimension (matching the paper's Eq.15 and the ratio's
+                    # own log_ratio_per_dim.sum(dim=-1) above), then mean
+                    # over the M,N,cfm_n Monte Carlo samples. Using a flat
+                    # .mean() here previously averaged over the action dim
+                    # too, silently shrinking brownian_loss by a constant
+                    # factor of n_actions relative to the paper's formula.
+                    brownian_loss = (eta_t ** 2).sum(dim=-1).mean()
                 else:
-                    brownian_loss = th.zeros((), device=mb_cfm_loss.device)
+                    brownian_loss = th.zeros((), device=h_seq.device)
 
                 # Gaussian entropy bonus on the learned terminal-noise sigma
                 # (PolicyFlow Eq.15's second term): sigma is a single
@@ -310,7 +540,7 @@ class FPOContinuousLearner:
                     )
                 else:
                     sigma = self.mac.agent.sigma().detach()
-                    gaussian_entropy = th.zeros((), device=mb_cfm_loss.device)
+                    gaussian_entropy = th.zeros((), device=h_seq.device)
 
                 advantages_by_time = advantages.reshape(-1, self.n_agents)
                 mb_advantages_2d = advantages_by_time[mb_time_idx]   # [M,N]
@@ -324,72 +554,20 @@ class FPOContinuousLearner:
                     # draw (it's the noise it *would* have taken had clamping
                     # not intervened, which is a biased quantity exactly on the
                     # boundary-heavy samples this whole investigation is about).
-                    #
-                    # delta_v approximates how far the flow endpoint would shift
-                    # under the NEW policy. This must be evaluated along the
-                    # REAL rollout path z->phi_hat (the paper's own design),
-                    # not the separate cfm_eps neighborhood points used for the
-                    # CFM loss above -- those are extra, independently-sampled
-                    # probe points with no relation to the z that actually
-                    # produced this transition's action, and using them here
-                    # was found empirically to make the ratio's corrective
-                    # signal collapse toward 0 (delta_v_abs_mean shrank as
-                    # action_at_bound_fraction climbed to 90%+ in a 2M-step
-                    # run), i.e. too weak to resist collapse. This costs one
-                    # extra pair of velocity() calls (mac + old_mac) at the
-                    # cfm_t sample points, reused only as a Monte Carlo t-grid
-                    # along the new, correct interpolation line.
                     n_flat = batch["action_noise"][:, :-1].float().reshape(
                         -1, self.n_agents, self.n_actions
                     )
-                    z_flat = batch["z"][:, :-1].float().reshape(
-                        -1, self.n_agents, self.n_actions
-                    )
-                    phi_flat = batch["action_raw"][:, :-1].float().reshape(
-                        -1, self.n_agents, self.n_actions
-                    )
                     n_noise = n_flat[mb_time_idx]                   # [M,N,A]
-                    mb_z = z_flat[mb_time_idx]                      # [M,N,A]
-                    mb_phi = phi_flat[mb_time_idx]                  # [M,N,A]
-
-                    cfm_n = mb_cfm_loss.shape[2]
-                    z_exp = mb_z.unsqueeze(2).expand(-1, -1, cfm_n, -1)
-                    phi_exp = mb_phi.unsqueeze(2).expand(-1, -1, cfm_n, -1)
-                    t_grid = mb_flat_t.reshape(mb_z.shape[0], mb_z.shape[1], cfm_n, 1)
-                    x_t_real = (1 - t_grid) * z_exp + t_grid * phi_exp   # [M,N,cfm_n,A]
-
-                    h_exp_real = mb_flat_h.reshape(
-                        mb_z.shape[0], mb_z.shape[1], cfm_n, -1
-                    )
-                    flat_h_real = h_exp_real.reshape(-1, h_exp_real.shape[-1])
-                    flat_x_t_real = x_t_real.reshape(-1, x_t_real.shape[-1])
-                    flat_t_real = t_grid.reshape(-1, 1)
-
-                    v_new_real = self.mac.agent.velocity(
-                        flat_h_real, flat_x_t_real, flat_t_real
-                    ).reshape_as(x_t_real)
-                    # v_old must go through old_mac's OWN encoder output
-                    # (mb_old_h, built above from old_h_seq), never mb_flat_h
-                    # / flat_h_real which come from self.mac's encoder.
-                    old_h_exp_real = mb_old_h.unsqueeze(2).expand(-1, -1, cfm_n, -1)
-                    old_flat_h_real = old_h_exp_real.reshape(-1, old_h_exp_real.shape[-1])
-                    with th.no_grad():
-                        v_old_real = self.old_mac.agent.velocity(
-                            old_flat_h_real, flat_x_t_real, flat_t_real
-                        ).reshape_as(x_t_real)
 
                     # Do NOT average delta_v over the cfm_n t-samples before
                     # building the ratio: log_ratio is quadratic in delta_v, so
                     # E_t[log_ratio(delta_v_t)] != log_ratio(E_t[delta_v_t]) --
                     # averaging first lets velocity shifts of opposite sign at
                     # different t cancel out, silently shrinking the ratio's
-                    # corrective signal (this was very likely a second,
-                    # compounding cause of delta_v_abs_mean shrinking as
-                    # collapse deepened, on top of the cfm_eps-vs-real-z bug).
-                    # Instead: compute a separate ratio/surrogate at each of
-                    # the cfm_n sampled t's, and only average the final
-                    # per-sample PPO loss -- the correct Monte Carlo estimate
-                    # of E_p(t)[surrogate].
+                    # corrective signal. Instead: compute a separate
+                    # ratio/surrogate at each of the cfm_n t-grid points, and
+                    # only average the final per-sample PPO loss -- the
+                    # correct Monte Carlo estimate of E_p(t)[surrogate].
                     delta_v = v_new_real - v_old_real                # [M,N,cfm_n,A]
                     n_noise_exp = n_noise.unsqueeze(2).expand_as(delta_v)  # same n for every t
 
@@ -415,7 +593,18 @@ class FPOContinuousLearner:
                     mb_rho_s = mb_rho_s_t.mean(dim=2)               # [M,N], for logging only
                     delta_v_abs_mean = delta_v.detach().abs().mean().item()
                     n_abs_mean = n_noise.detach().abs().mean().item()
+                    # cfm_loss is the OLD ratio mechanism's own quantity and is
+                    # never computed on this branch anymore (see class
+                    # docstring) -- logged as 0.0, not a meaningful value here.
+                    mb_cfm_loss_mean = 0.0
                 else:
+                    # Old cfm-loss-diff ratio: this mechanism's own design
+                    # needs the cfm_eps-based neighbourhood CFM loss (a
+                    # separate, independently-sampled probe path -- unrelated
+                    # to the real-z path built above for brownian_loss).
+                    mb_cfm_loss, _, _, _, _ = self._compute_cfm_loss_for_time_indices(
+                        batch, h_seq, mb_time_idx
+                    )
                     mb_initial_cfm_loss = initial_cfm_loss.reshape(
                         -1, self.n_agents, initial_cfm_loss.size(-2), initial_cfm_loss.size(-1)
                     )[mb_time_idx]
@@ -423,6 +612,7 @@ class FPOContinuousLearner:
                     diff_mean = diff.mean(dim=(-2, -1))                   # [M,N]
                     mb_rho_s = th.exp(th.clamp(diff_mean, -rho_clip, rho_clip))  # [M,N]
                     delta_v_abs_mean = n_abs_mean = 0.0
+                    mb_cfm_loss_mean = mb_cfm_loss.mean(dim=(-2, -1)).mean().item()
 
                     mb_rho_s_flat = mb_rho_s.reshape(-1)
                     mb_advantages = mb_advantages_2d.reshape(-1)
@@ -448,10 +638,10 @@ class FPOContinuousLearner:
                     M, N, H = mb_h.shape
                     K = entropy_n_samples
                     h_rep = mb_h.unsqueeze(2).expand(-1, -1, K, -1).reshape(-1, H)
-                    ent_eps = th.rand(M * N * K, self.n_actions, device=mb_h.device)
+                    ent_eps = th.randn(M * N * K, self.n_actions, device=mb_h.device)
                     n_steps = getattr(self.args, "cfm_rollout_steps", 10)
                     x1 = self.mac.agent.integrate(h_rep, ent_eps, n_steps)
-                    sampled_actions = th.clamp(x1, 0.0, 1.0).reshape(M, N, K, self.n_actions)
+                    sampled_actions = th.sigmoid(x1).reshape(M, N, K, self.n_actions)
                     entropy = sampled_actions.var(dim=2, unbiased=False).mean()
                 else:
                     entropy = th.zeros((), device=mb_advantages.device)
@@ -459,7 +649,6 @@ class FPOContinuousLearner:
                 actor_loss = (
                     pg_loss
                     - entropy_coef * entropy
-                    + lambda_trust * trust_loss
                     + w_b * brownian_loss
                     - w_g * gaussian_entropy
                 )
@@ -476,9 +665,7 @@ class FPOContinuousLearner:
                     mb_advantages.std(unbiased=False).item()
                 )
                 actor_stats["pg_loss"].append(pg_loss.item())
-                actor_stats["cfm_loss_mean"].append(
-                    mb_cfm_loss.mean(dim=(-2, -1)).mean().item()
-                )
+                actor_stats["cfm_loss_mean"].append(mb_cfm_loss_mean)
                 actor_stats["rho_s_mean"].append(mb_rho_s.mean().item())
                 actor_stats["rho_s_std"].append(mb_rho_s.std(unbiased=False).item())
                 actor_stats["clip_fraction"].append(
@@ -489,7 +676,6 @@ class FPOContinuousLearner:
                 )
                 actor_stats["actor_grad_norm"].append(grad_norm.item())
                 actor_stats["entropy_mean"].append(entropy.item())
-                actor_stats["trust_loss"].append(trust_loss.item())
                 actor_stats["brownian_loss"].append(brownian_loss.item())
                 actor_stats["gaussian_entropy"].append(gaussian_entropy.item())
                 actor_stats["sigma_mean"].append(sigma.mean().item())
@@ -517,6 +703,39 @@ class FPOContinuousLearner:
             self.logger.log_stat("action_std", action_std, t_env)
             self.logger.log_stat(
                 "action_at_bound_fraction", action_at_bound_fraction, t_env
+            )
+            self.logger.log_stat("force_x_mean", force_x_mean, t_env)
+            self.logger.log_stat("force_y_mean", force_y_mean, t_env)
+            self.logger.log_stat(
+                "force_magnitude_mean", force_magnitude_mean, t_env
+            )
+            self.logger.log_stat(
+                "force_near_zero_fraction", force_near_zero_fraction, t_env
+            )
+            self.logger.log_stat(
+                "force_near_max_fraction", force_near_max_fraction, t_env
+            )
+            self.logger.log_stat("force_x_agent_std", force_x_agent_std, t_env)
+            self.logger.log_stat("force_y_agent_std", force_y_agent_std, t_env)
+            for i, (fx_i, fy_i) in enumerate(zip(per_agent_fx, per_agent_fy)):
+                self.logger.log_stat(f"force_x_agent{i}_mean", fx_i, t_env)
+                self.logger.log_stat(f"force_y_agent{i}_mean", fy_i, t_env)
+            self.logger.log_stat(
+                "agents_same_action_fraction", agents_same_action_fraction, t_env
+            )
+            self.logger.log_stat(
+                "agents_all_same_action_fraction",
+                agents_all_same_action_fraction,
+                t_env,
+            )
+            self.logger.log_stat("far_fast_fraction", far_fast_fraction, t_env)
+            self.logger.log_stat("near_slow_fraction", near_slow_fraction, t_env)
+            self.logger.log_stat(
+                "near_still_fast_fraction", near_still_fast_fraction, t_env
+            )
+            self.logger.log_stat("oscillation_fraction", oscillation_fraction, t_env)
+            self.logger.log_stat(
+                "oscillation_fraction_phi_only", oscillation_fraction_phi_only, t_env
             )
             self.logger.log_stat(
                 "action_overshoot_mean", action_overshoot_mean, t_env
@@ -549,12 +768,8 @@ class FPOContinuousLearner:
             self.logger.log_stat("pg_loss", self._mean_stat(actor_stats["pg_loss"]), t_env)
             # Only log mechanism-specific diagnostics while their coefficient
             # actually makes them nonzero -- otherwise they're flat-zero lines
-            # cluttering wandb (lambda_trust/w_b/entropy_coef are all 0 while
+            # cluttering wandb (w_b/entropy_coef are 0 while
             # use_policyflow_ratio is being tested in isolation).
-            if lambda_trust > 0.0:
-                self.logger.log_stat(
-                    "trust_loss", self._mean_stat(actor_stats["trust_loss"]), t_env
-                )
             if w_b > 0.0:
                 self.logger.log_stat(
                     "brownian_loss", self._mean_stat(actor_stats["brownian_loss"]), t_env

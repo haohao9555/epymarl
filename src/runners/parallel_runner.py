@@ -77,19 +77,34 @@ class ParallelRunner:
         self.scheme = scheme
         self.groups = groups
         self.preprocess = preprocess
+        # Two independent flags, driven entirely by which fields run.py put in
+        # the scheme: collect_cfm covers the OLD FPO ratio mechanism's own
+        # neighbourhood-probe fields (skipped entirely when
+        # use_policyflow_ratio=True, since that ratio never reads them --
+        # see run.py's scheme setup); collect_pf_fields covers what the
+        # active PolicyFlow ratio actually needs (z/action_raw/action_noise),
+        # which must keep being collected independently of collect_cfm.
         self.collect_cfm = all(
             key in scheme for key in ("cfm_eps", "cfm_t", "initial_cfm_loss")
+        )
+        self.collect_pf_fields = all(
+            key in scheme for key in ("action_raw", "action_noise", "z")
         )
 
     def sample_cfm_points(self, batch_size):
         return (
-            th.rand(
+            # cfm_eps: neighbourhood probe points in z-space, must match the
+            # actor's actual base distribution (N(0,I), see fpo_actor.py) so
+            # the CFM loss trains v on plausible eps values.
+            th.randn(
                 batch_size,
                 self.args.n_agents,
                 self.args.cfm_n_samples,
                 self.args.cfm_action_dim,
                 device=self.batch.device,
             ),
+            # cfm_t: interpolation time, always Uniform(0,1) regardless of
+            # the base distribution's shape.
             th.rand(
                 batch_size,
                 self.args.n_agents,
@@ -180,6 +195,11 @@ class ParallelRunner:
                             self.mac._last_x1_raw[envs_not_terminated],
                             bs=envs_not_terminated,
                         ).unsqueeze(1),
+                    }
+                )
+            if self.collect_pf_fields:
+                actions_chosen.update(
+                    {
                         "action_raw": self.mac._last_x1_raw[envs_not_terminated]
                         .detach()
                         .unsqueeze(1),
