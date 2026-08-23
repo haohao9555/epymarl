@@ -80,6 +80,14 @@ class FPOContinuousLearner:
             "rho_s_std": [],
             "clip_fraction": [],
             "actor_grad_norm": [],
+            #------新增：A<0 且未被 eps_clip 截断的样本上，诊断 rho_s * residual 是否随训练衰减----------
+            # 理论上：r=exp(L_old-L_new) 随残差指数衰减，∇L_new 随残差线性增长，
+            # r * ||∇L_new|| 应当 -> 0（"自我熄灭"）。若这个量不降反升，说明梯度没有
+            # 随 rho_s 正常衰减，权重实际上被钉成了近似常数。
+            #-----------------------------
+            "neg_A_active_rho_s_mean": [],
+            "neg_A_active_weighted_residual": [],
+            "neg_A_clip_fraction": [],
         }
         critic_train_stats = {
             k: [] for k in ["critic_loss", "critic_grad_norm", "td_error_abs",
@@ -123,9 +131,15 @@ class FPOContinuousLearner:
                 diff = mb_initial_cfm_loss - mb_cfm_loss              # [M,N,cfm_n,1]
                 diff_mean = diff.mean(dim=(-2, -1))                   # [M,N]
                 mb_rho_s = th.exp(th.clamp(diff_mean, -rho_clip, rho_clip))  # [M,N]
+                # ------新增：残差幅度代理，用于诊断 exp(-x)*x -> 0 是否真的在发生 ----------
+                # sqrt(L_new) 正比于 CFM 回归残差 ||v_pred - target|| 的均方根，
+                # 是 ||∇_v_pred L_new|| 的廉价代理（无需对每个样本单独反传求参数梯度）。
+                # -----------------------------------------------------------------------------
+                cfm_residual_rms = mb_cfm_loss.mean(dim=(-2, -1)).sqrt()      # [M,N]
 
                 mb_rho_s = mb_rho_s.reshape(-1)
                 mb_advantages = mb_advantages_2d.reshape(-1)
+                cfm_residual_rms = cfm_residual_rms.reshape(-1)
                 surr1 = mb_rho_s * mb_advantages
                 surr2 = th.clamp(
                     mb_rho_s, 1 - self.args.eps_clip, 1 + self.args.eps_clip
@@ -157,6 +171,30 @@ class FPOContinuousLearner:
                     ).float().mean().item()
                 )
                 actor_stats["actor_grad_norm"].append(grad_norm.item())
+
+                # ------新增：A<0 诊断，检验"残差变大->有效权重是否随之衰减" ----------
+                with th.no_grad():
+                    neg_mask = mb_advantages < 0
+                    unclipped_mask = (
+                        (mb_rho_s >= 1 - self.args.eps_clip)
+                        & (mb_rho_s <= 1 + self.args.eps_clip)
+                    )
+                    active_neg = neg_mask & unclipped_mask   # A<0 且梯度未被 clip 置零的样本
+                    if active_neg.any():
+                        actor_stats["neg_A_active_rho_s_mean"].append(
+                            mb_rho_s[active_neg].mean().item()
+                        )
+                        actor_stats["neg_A_active_weighted_residual"].append(
+                            (mb_rho_s[active_neg] * cfm_residual_rms[active_neg])
+                            .mean()
+                            .item()
+                        )
+                    if neg_mask.any():
+                        actor_stats["neg_A_clip_fraction"].append(
+                            (neg_mask & ~unclipped_mask).float().sum().item()
+                            / neg_mask.float().sum().item()
+                        )
+                # -----------------------------------------------------------------------------
 
         self.critic_training_steps += 1
         if (
@@ -198,6 +236,23 @@ class FPOContinuousLearner:
             self.logger.log_stat(
                 "fpo_valid_transitions", valid_time_indices.numel(), t_env
             )
+            # ------新增：A<0 侧的"权重是否随残差衰减"诊断 ----------
+            self.logger.log_stat(
+                "neg_A_active_rho_s_mean",
+                self._mean_stat(actor_stats["neg_A_active_rho_s_mean"]),
+                t_env,
+            )
+            self.logger.log_stat(
+                "neg_A_active_weighted_residual",
+                self._mean_stat(actor_stats["neg_A_active_weighted_residual"]),
+                t_env,
+            )
+            self.logger.log_stat(
+                "neg_A_clip_fraction",
+                self._mean_stat(actor_stats["neg_A_clip_fraction"]),
+                t_env,
+            )
+            # -----------------------------------------------------------------------------
             self.log_stats_t = t_env
 
     def _build_actor_hidden_sequence(self, batch: EpisodeBatch) -> th.Tensor:
@@ -217,12 +272,7 @@ class FPOContinuousLearner:
         x_t = (1 - cfm_t) * eps + cfm_t * act_exp
         h_exp = h_seq.unsqueeze(3).expand(-1, -1, -1, eps.size(3), -1)
 
-        flat_h = h_exp.reshape(-1, h_exp.shape[-1])
-        flat_x_t = x_t.reshape(-1, x_t.shape[-1])
-        flat_t = cfm_t.reshape(-1, 1)
-
-        v_pred = self.mac.agent.velocity(flat_h, flat_x_t, flat_t)
-        v_pred = v_pred.reshape_as(eps)
+        v_pred = self.mac.velocity(h_exp, x_t, cfm_t)
 
         cfm_target_type = getattr(self.args, "cfm_target_type", "velocity")
         if cfm_target_type == "velocity":
@@ -260,12 +310,7 @@ class FPOContinuousLearner:
         x_t = (1 - mb_cfm_t) * mb_eps + mb_cfm_t * act_exp
         h_exp = mb_h.unsqueeze(2).expand(-1, -1, mb_eps.size(2), -1)
 
-        flat_h = h_exp.reshape(-1, h_exp.shape[-1])
-        flat_x_t = x_t.reshape(-1, x_t.shape[-1])
-        flat_t = mb_cfm_t.reshape(-1, 1)
-
-        v_pred = self.mac.agent.velocity(flat_h, flat_x_t, flat_t)
-        v_pred = v_pred.reshape_as(mb_eps)
+        v_pred = self.mac.velocity(h_exp, x_t, mb_cfm_t)
 
         cfm_target_type = getattr(self.args, "cfm_target_type", "velocity")
         if cfm_target_type == "velocity":

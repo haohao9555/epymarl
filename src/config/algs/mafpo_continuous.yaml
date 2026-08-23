@@ -5,6 +5,7 @@ mac: "fpo_mac"
 agent: "fpo_actor"
 learner: "fpo_continuous_learner"
 critic_type: "fpo_critic"
+fpo_individual_agents: True
 
 # Collect independent environments in subprocesses under one training run.
 batch_size_run: 8
