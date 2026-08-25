@@ -1,0 +1,73 @@
+# --- Continuous "FPO++ (shared network, single advantage)" ---
+# Ablation against fpopp_continuous.yaml: same per-point-ratio + SPO-for-A<0
+# learner math, but two structural differences:
+#   - fpo_individual_agents: False -> fpo_mac.py's ORIGINAL shared-actor
+#     branch (one set of parameters for all N agents, differentiated only
+#     via the obs_agent_id one-hot input) -- the pre-0313c24 design.
+#   - critic_type: "fpo_shared_critic" -> a single joint V(s), no
+#     per-agent conditioning, so every agent gets the exact same advantage
+#     number at a given timestep (see fpopp_shared_continuous_learner.py's
+#     docstring for the shape-level detail).
+# common_reward must stay True (asserted in the learner's __init__).
+
+runner: "parallel"
+mac: "fpo_mac"
+agent: "fpo_actor"
+learner: "fpopp_shared_continuous_learner"
+critic_type: "fpo_shared_critic"
+fpo_individual_agents: False
+
+# Collect independent environments in subprocesses under one training run.
+batch_size_run: 8
+
+# Keep enough complete episodes to cover roughly 2048 transitions, then clear
+# the buffer after one on-policy train call.
+buffer_size: 128
+batch_size: 8
+fpo_rollout_timesteps: 2048
+
+# Each environment timestep stores this many fixed CFM neighbourhood points.
+cfm_n_samples: 50   # 2026-08-25: 10 -> 50, more MC points per transition to reduce ratio/gradient variance (see conversation notes)
+cfm_rho_clip: 3.0   # kept as-is, numerical guardrail only
+cfm_target_type: "velocity"
+
+# Euler integration steps for rollout/eval sampling (t=0 -> t=1).
+cfm_rollout_steps: 10
+
+# actor uses sigmoid (not hard clamp), so the CFM regression target is the
+# unbounded x1_raw -- the velocity network's output must stay bounded or
+# cfm_loss_mean diverges over long runs (same mechanism/fix as
+# fpo_continuous.yaml/mafpo_continuous.yaml, see fpo_actor.py velocity()'s comment).
+cfm_velocity_bound: 8.0
+
+# 2026-08-25 本地追加：见 fpopp_continuous.yaml 里同名字段的注释。
+jacobian_ratio_correction: True
+
+# Shuffle the collected rollout transitions and train for 10 passes.
+fpo_minibatch_size: 512   # 2026-08-25: 256 -> 512, larger minibatch to reduce gradient variance
+epochs: 2   # 2026-08-25: 4 -> 2, fewer passes over the same rollout batch per collection round
+
+target_update_interval_or_tau: 0.01
+
+lr: 0.00003   # 2026-08-25: 3e-4 -> 3e-5, applies to both actor and critic optimisers
+grad_norm_clip: 10   # unchanged from default.yaml, made explicit
+hidden_dim: 128
+
+obs_agent_id: True
+obs_last_action: False
+obs_individual_obs: False
+
+use_rnn: True
+standardise_returns: True
+standardise_rewards: True
+gae_lambda: 0.95
+eps_clip: 0.05   # 2026-08-25: 0.2 -> 0.05, tighter trust region (see conversation notes on SPO's 1/eps curvature)
+name: "fpopp_shared_continuous"
+
+use_wandb: True
+wandb_team: "adolf9555-university-of-technology-sydney"
+wandb_project: "epymarl-mpe"
+wandb_run_name: "FPO++-shared-MPE"
+wandb_mode: "online"
+
+t_max: 20050000

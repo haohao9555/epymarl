@@ -4,6 +4,18 @@ import torch.nn.functional as F
 
 #------新增：FPO 独立 Actor 网络（速度场）----------
 #-----------------------------
+# 2026-08-25 修改：hard clamp(x1,0,1) 换成 sigmoid(x1)。individual actors 独立
+# 开了参数之后，实测 hard clamp 版本训练早期 action_at_bound_fraction 冲到
+# 90%+——clamp 的导数在边界外恒为 0，越界多远都一样，等价于把"离谱的输出"和
+# "刚好压线的输出"混为一谈，噪声/未训练输出被大量钉死在边界。换成 sigmoid 后
+# 不再有硬边界，越界越远梯度只是变小不是消失；同时把 CFM 回归的插值目标从
+# "sigmoid 之后的、被压缩过的 action"改回"sigmoid 之前的无界 latent 终点 x1"
+# （sample_action 新增返回的第 4 个值），避免流本身的训练信号又在压缩边界上
+# 重新踩坑。velocity() 的输出额外加了 tanh 限幅：CFM 回归目标一旦无界，没有
+# 这层限幅速度场权重会被推向发散（实测 cfm_loss_mean 在几百万步内飙到 1e20+
+# 量级、训练整体崩掉），限幅之后 cfm_loss 天然有上限，饱和区梯度趋于 0 也不会
+# 无限推大权重。
+#-----------------------------
 
 
 class FPOActor(nn.Module):
@@ -16,8 +28,10 @@ class FPOActor(nn.Module):
     rollout 采样（K 步 Euler，从 t=0 积分到 t=1，K = args.cfm_rollout_steps）：
         x_0 = eps ~ N(0,I)
         x_{t+dt} = x_t + dt * v(h, x_t, t)
-        action = clamp(x_1, 0, 1)
-    训练 CFM   : cfm_loss = ||v(h, x_t, t) - (action - eps)||²
+        action = sigmoid(x_1)      （全程无界 latent，sigmoid 是唯一的映射步）
+    训练 CFM   : cfm_loss = ||v(h, x_t, t) - (x_1 - eps)||²   （插值目标是无界的
+                 x_1，不是 sigmoid 之后的 action——见 fpo_mac.py 里
+                 _last_x1_raw 的存储/使用）
     """
 
     def __init__(self, input_shape, args):
@@ -60,9 +74,14 @@ class FPOActor(nn.Module):
         h:   [..., hidden_dim]
         x_t: [..., n_actions]   插值点
         t:   [..., 1]           时间标量 0~1
+
+        输出用 tanh 限幅到 [-cfm_velocity_bound, cfm_velocity_bound]，理由见
+        文件顶部注释。
         """
         inp = th.cat([h, x_t, t], dim=-1)
-        return self.vel_fc2(F.relu(self.vel_fc1(inp)))
+        raw = self.vel_fc2(F.relu(self.vel_fc1(inp)))
+        bound = getattr(self.args, "cfm_velocity_bound", 8.0)
+        return bound * th.tanh(raw / bound)
 
     # ── MAC 兼容接口 ──────────────────────────────────────────────────────────
 
@@ -95,19 +114,21 @@ class FPOActor(nn.Module):
         """K 步 flow 采样。
 
         x_0 = eps ~ N(0,I)
-        action = clamp(integrate(h, eps, K), 0, 1)
+        action = sigmoid(integrate(h, eps, K))
 
-        返回: (action, h, eps)
-            action: [..., n_actions]  实际执行的动作
+        返回: (action, h, eps, x1)
+            action: [..., n_actions]  实际执行的动作，sigmoid(x1) ∈ (0,1)
             h:      [..., hidden_dim] 更新后的 hidden state
             eps:    [..., n_actions]  本次采样的噪声（供 initial_cfm_loss 用）
+            x1:     [..., n_actions]  sigmoid 之前的无界积分终点，CFM 回归的
+                    插值目标用它而不是 action 本身（见类 docstring）
         """
         h = self.encode(inputs, hidden_state)
         n_act = self.args.n_actions
         eps = th.randn(*h.shape[:-1], n_act, device=h.device)
         n_steps = getattr(self.args, "cfm_rollout_steps", 1)
         x1 = self.integrate(h, eps, n_steps)
-        action = th.clamp(x1, 0.0, 1.0)
-        return action, h, eps
+        action = th.sigmoid(x1)
+        return action, h, eps, x1
 
 #-----------------------------

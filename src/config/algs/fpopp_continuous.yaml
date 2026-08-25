@@ -1,0 +1,76 @@
+# --- Continuous "FPO++" parameters for Box(0, 1) action spaces ---
+# Forked from mafpo_continuous.yaml -- same MAC/actor/critic
+# (fpo_mac/fpo_actor/fpo_critic, unchanged, reused as-is), only the
+# learner differs (fpopp_continuous_learner.py): no pre-averaging over the
+# cfm_n neighbourhood samples before exponentiating (each sampled point gets
+# its own ratio), and A<0 samples use a smooth SPO-style surrogate instead
+# of the standard PPO hard clip. See fpopp_continuous_learner.py's
+# docstring for the full derivation.
+
+runner: "parallel"
+mac: "fpo_mac"
+agent: "fpo_actor"
+learner: "fpopp_continuous_learner"
+critic_type: "fpo_critic"
+fpo_individual_agents: True
+
+# Collect independent environments in subprocesses under one training run.
+batch_size_run: 8
+
+# Keep enough complete episodes to cover roughly 2048 transitions, then clear
+# the buffer after one on-policy train call.
+buffer_size: 128
+batch_size: 8
+fpo_rollout_timesteps: 2048
+
+# Each environment timestep stores this many fixed CFM neighbourhood points.
+cfm_n_samples: 50   # 2026-08-25: 10 -> 50, more MC points per transition to reduce ratio/gradient variance (see conversation notes)
+cfm_rho_clip: 3.0   # kept as-is, numerical guardrail only
+cfm_target_type: "velocity"
+
+# Euler integration steps for rollout/eval sampling (t=0 -> t=1).
+cfm_rollout_steps: 10
+
+# actor uses sigmoid (not hard clamp), so the CFM regression target is the
+# unbounded x1_raw -- the velocity network's output must stay bounded or
+# cfm_loss_mean diverges over long runs (same mechanism/fix as
+# fpo_continuous.yaml/mafpo_continuous.yaml, see fpo_actor.py velocity()'s comment).
+cfm_velocity_bound: 8.0
+
+# 2026-08-25 本地追加：ratio 是在 sigmoid 之前的无界 latent u=action_raw 上算的
+# CFM-loss-diff 代理，不是显式密度比，sigmoid 的雅可比 sigma'(u)=a(1-a) 从没被
+# 处理过——一旦 u 落进 sigmoid 饱和区，u 的大幅移动只对应 a 的极小移动，ratio
+# 却照 u 空间的尺度报告"策略变了多少"，必然失真（不是"可能"，是 sigmoid 饱和
+# 的数学性质决定的）。True 时用归一化雅可比 w=4*a*(1-a)∈[0,1] 对每个采样点的
+# diff 加权，压低饱和区样本对 ratio 的贡献；诊断量 jac_diag_* 无论开关与否都会
+# 记录。见 fpopp_continuous_learner.py 里 jac_w 的注释。
+jacobian_ratio_correction: True
+
+# Shuffle the collected rollout transitions and train for 10 passes.
+fpo_minibatch_size: 512   # 2026-08-25: 256 -> 512, larger minibatch to reduce gradient variance
+epochs: 2   # 2026-08-25: 4 -> 2, fewer passes over the same rollout batch per collection round
+
+target_update_interval_or_tau: 0.01
+
+lr: 0.00003   # 2026-08-25: 3e-4 -> 3e-5, applies to both actor and critic optimisers
+grad_norm_clip: 10   # unchanged from default.yaml, made explicit
+hidden_dim: 128
+
+obs_agent_id: True
+obs_last_action: False
+obs_individual_obs: False
+
+use_rnn: True
+standardise_returns: True
+standardise_rewards: True
+gae_lambda: 0.95
+eps_clip: 0.05   # 2026-08-25: 0.2 -> 0.05, tighter trust region (see conversation notes on SPO's 1/eps curvature)
+name: "fpopp_continuous"
+
+use_wandb: True
+wandb_team: "adolf9555-university-of-technology-sydney"
+wandb_project: "epymarl-mpe"
+wandb_run_name: "FPO++-MPE"
+wandb_mode: "online"
+
+t_max: 20050000

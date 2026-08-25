@@ -8,37 +8,41 @@ from components.standarize_stream import RunningMeanStd
 from modules.critics import REGISTRY as critic_registry
 
 
-class FPOContinuousLearner:
-    """Continuous FPO learner.
+class FPOPPContinuousLearner:
+    """Continuous "FPO++" learner. Forked from FPOContinuousLearner
+    (fpo_continuous_learner.py) -- same MAC/actor/critic
+    (fpo_mac/fpo_actor/fpo_critic, unchanged, reused as-is), only the
+    ratio/surrogate math in this train() differs. Two changes on top of
+    plain MAFPO:
 
-    The rollout policy stores fixed CFM eps/t/action points. During training we
-    recompute the current CFM loss at those same points and use the loss change
-    to build the FPO ratio:
+    1. No pre-averaging over the cfm_n neighbourhood samples before
+       exponentiating. MAFPO computes one ratio per transition by averaging
+       the cfm_n loss differences first:
+           rho = exp(mean_i(L_old^(i) - L_new^(i)))
+       Since exp is nonlinear, mean_i(exp(diff_i)) != exp(mean_i(diff_i)) --
+       averaging the diffs first lets loss-difference swings of opposite
+       sign at different sample points cancel out before the ratio ever sees
+       them, discarding real dispersion information. Instead, each of the
+       cfm_n sampled (tau_i, eps_i) points gets its own ratio:
+           rho_i = exp(clamp(L_old^(i) - L_new^(i), -rho_clip, rho_clip)),  i=1..cfm_n
+       and the PPO/SPO surrogate below is evaluated at each rho_i
+       separately; only the final per-point surrogate values are averaged
+       (over the minibatch AND cfm_n together), not the ratios or the raw
+       loss differences.
 
-        rho_s = exp(mean(clamp(L_old - L_new, -rho_clip, rho_clip)))
-
-    2026-08-25 changes on top of the individual-actors (0313c24) baseline,
-    none of which touch the ratio formula above -- these are correctness
-    fixes, see each section's comment for the reasoning:
-
-    1. fpo_actor.py switched from hard clamp(x1,0,1) to sigmoid(x1) (see its
-       own top-of-file comment for why) -- the CFM regression/ratio target
-       here follows suit and now interpolates toward action_raw (the
-       sigmoid-pre-image), not the executed action.
-    2. jacobian_ratio_correction: sigmoid saturation necessarily distorts the
-       ratio (a large move in the unbounded latent can correspond to a tiny
-       move in the executed action, and vice versa) -- optionally down-weight
-       each sample's contribution by how saturated its executed action is.
-    3. Advantages/target_returns are now computed ONCE per train() call
-       (hoisted out of the epoch loop) instead of being recomputed every
-       epoch -- the old per-epoch recomputation used self.target_critic,
-       which never changes within one train() call, so it was producing the
-       same values every time, just wastefully.
-    4. individual_agents=True now gets a real per-agent optimiser + per-agent
-       gradient-norm clip, instead of one shared Adam + one globally-clipped
-       gradient across all N agents' concatenated parameters (which let one
-       agent's large gradient throttle the other two, silently re-coupling
-       agents that are supposed to be fully independent).
+    2. For A<0 samples, the standard PPO clip surrogate
+       min(rho*A, clip(rho,1-eps,1+eps)*A) is replaced by a smooth SPO-style
+       objective:
+           psi_SPO(rho, A) = rho*A - (|A| / (2*eps_clip)) * (rho-1)^2
+       PPO's hard clip gives exactly zero gradient once rho drops below
+       1-eps_clip for A<0 -- this is the "self-extinguishing" failure mode
+       MAFPO's own neg_A_active_rho_s_mean/neg_A_clip_fraction diagnostics
+       were built to detect. SPO's gradient equals the unclipped policy
+       gradient A at rho=1 (no discontinuity there), shrinks smoothly (not
+       abruptly) as rho crosses the old clip boundary, and past that
+       boundary turns into a restoring force pulling rho back toward it --
+       never a flat zero-gradient region. A>=0 samples still use the
+       standard PPO clip surrogate unchanged.
     """
 
     def __init__(self, mac, scheme, logger, args):
@@ -105,6 +109,62 @@ class FPOContinuousLearner:
         mask = mask.repeat(1, 1, self.n_agents)
         critic_mask = mask.clone()
 
+        # ------新增：noise-domination 诊断 ----------
+        # individual actors (0313c24) 修复的是"共享网络导致跨智能体 Delta 混
+        # 入"——症状是不同 agent 在同一时刻的动作被同一份共享参数/共享噪声主
+        # 导，看起来彼此雷同而不是各自对自己的观测做出反应。这里直接量化这个
+        # 症状，而不是间接猜：
+        #   action_at_bound_fraction: 动作贴 [0,1] 边界的比例（噪声主导/塌缩
+        #       的经典表现，hard clamp 会把越界的噪声钉在边界上）。
+        #   agents_same_action_fraction / agents_all_same_action_fraction:
+        #       同一时刻 >=2 / 全部 N 个 agent 的动作方向类别相同的比例（按
+        #       pz-mpe-simple-spread 的 5 维动作物理意义分类，跟
+        #       policyflow_continuous_learner.py 里的同名诊断同一套逻辑，直
+        #       接对照两条线是否有区别）。如果 individual actors 真的解决了
+        #       Delta 混入，这两个比例应该明显低于 shared-network 版本。
+        actions_taken = batch["actions"][:, :-1].float()          # [B,T,N,A]
+        action_valid = mask.unsqueeze(-1).expand_as(actions_taken).bool()
+        valid_actions = actions_taken[action_valid]
+        bound_eps = 0.02
+        if valid_actions.numel() > 0:
+            at_bound = (valid_actions < bound_eps) | (valid_actions > 1 - bound_eps)
+            action_at_bound_fraction = at_bound.float().mean().item()
+        else:
+            action_at_bound_fraction = 0.0
+
+        if self.n_actions >= 5:
+            force_x = actions_taken[..., 2] - actions_taken[..., 1]   # [B,T,N]
+            force_y = actions_taken[..., 4] - actions_taken[..., 3]
+            still_thresh = 0.15
+            is_still = (force_x.abs() < still_thresh) & (force_y.abs() < still_thresh)
+            x_dominant = force_x.abs() >= force_y.abs()
+            # category ids: 0=still, 1=+x, 2=-x, 3=+y, 4=-y
+            category = th.zeros_like(force_x, dtype=th.long)
+            category = th.where(is_still, th.zeros_like(category), category)
+            moving = ~is_still
+            category = th.where(moving & x_dominant & (force_x > 0), th.full_like(category, 1), category)
+            category = th.where(moving & x_dominant & (force_x <= 0), th.full_like(category, 2), category)
+            category = th.where(moving & (~x_dominant) & (force_y > 0), th.full_like(category, 3), category)
+            category = th.where(moving & (~x_dominant) & (force_y <= 0), th.full_like(category, 4), category)
+
+            step_valid = mask[..., 0].bool()                          # [B,T]
+            cat_onehot = th.nn.functional.one_hot(category, num_classes=5)  # [B,T,N,5]
+            cat_counts = cat_onehot.sum(dim=2)                        # [B,T,5]
+            max_count = cat_counts.amax(dim=-1)                       # [B,T]
+            valid_max_count = max_count[step_valid]
+            if valid_max_count.numel() > 0:
+                agents_same_action_fraction = (
+                    (valid_max_count >= 2).float().mean().item()
+                )
+                agents_all_same_action_fraction = (
+                    (valid_max_count >= self.n_agents).float().mean().item()
+                )
+            else:
+                agents_same_action_fraction = agents_all_same_action_fraction = 0.0
+        else:
+            agents_same_action_fraction = agents_all_same_action_fraction = 0.0
+        # -----------------------------------------------------------------------------
+
         initial_cfm_loss = batch["initial_cfm_loss"][:, :-1]    # [B,T,N,cfm_n,1]
         rho_clip = getattr(self.args, "cfm_rho_clip", 3.0)
 
@@ -140,8 +200,6 @@ class FPOContinuousLearner:
             k: [] for k in ["critic_loss", "critic_grad_norm", "td_error_abs",
                             "target_mean", "value_mean"]
         }
-
-        actions_taken = batch["actions"][:, :-1].float()   # [B,T,N,A], executed action
 
         # ------修复：advantage 只在 rollout 后算一次，整个 actor update phase 固定
         # 不变 ----------
@@ -192,9 +250,14 @@ class FPOContinuousLearner:
                 # u = action_raw（无界 latent，CFM 回归的插值目标），a = sigmoid(u)
                 # 才是环境真正执行的动作。diff/ratio 是在 u 空间的 CFM 回归 loss 差
                 # 上算出来的代理量，从来没有对 sigmoid 的雅可比 sigma'(u)=a(1-a) 做
-                # 过任何处理——sigmoid 饱和区（a 接近 0/1）里 u 的一次大幅移动只对
-                # 应 a 的一点点移动，ratio 却完全按 u 空间的尺度在报告"策略变了多
-                # 少"，这个失真是 sigmoid 饱和的数学性质决定的，不是"可能发生"。
+                # 过任何处理——如果这是一个严格的密度比，同一个 u 上算新旧密度之比
+                # 时雅可比会精确抵消（policyflow_actor.py 的 exact ratio 就是这么论
+                # 证的），但 cfm-loss-diff 根本不是一个显式密度比，没有这层保护。
+                # sigmoid 饱和区（a 接近 0/1）里 u 的一次大幅移动只对应 a 的一点点
+                # 移动——ratio 却完全按 u 空间的尺度在报告"策略变了多少"，把这个被
+                # 夸大的信号乘进 A<0 时的 SPO 惩罚 / A>=0 时的 PPO clip，可能是残余
+                # 不稳定的一个额外来源，跟"共享网络梯度冲突"那条线正交。
+                #
                 # w = 4*a*(1-a) ∈ [0,1]：u=0（未饱和，a=0.5）时 w=1，不打折；越往
                 # 饱和区走 w→0。mb_action 用已经存好的执行动作，不需要重新算 sigmoid。
                 mb_action = actions_taken.reshape(-1, self.n_agents, self.n_actions)[
@@ -202,11 +265,15 @@ class FPOContinuousLearner:
                 ]                                                    # [M,N,A]
                 jac_w = (4.0 * mb_action * (1.0 - mb_action)).mean(dim=-1)  # [M,N], in [0,1]
 
-                diff = mb_initial_cfm_loss - mb_cfm_loss              # [M,N,cfm_n,1]
+                # ------FPO++ 改动 1：不对 cfm_n 个采样点先取平均，直接逐点算 ratio ----------
+                # 见类 docstring。diff/rho 都保留 cfm_n 维，不在这里 reduce。
+                diff = (mb_initial_cfm_loss - mb_cfm_loss).squeeze(-1)   # [M,N,cfm_n]
 
+                # 诊断：饱和区 (jac_w 小) vs 非饱和区 (jac_w 大) 样本各自的 |diff| 均值，
+                # 无条件记录，不受下面的开关影响。
                 with th.no_grad():
                     sat_mask = jac_w < 0.5          # a 落在 [0.146, 0.854] 之外算"饱和"
-                    diff_flat_by_transition = diff.abs().mean(dim=(-2, -1))   # [M,N]
+                    diff_flat_by_transition = diff.abs().mean(dim=-1)   # [M,N]
                     if sat_mask.any():
                         jac_diag_sat_diff_abs_mean = diff_flat_by_transition[sat_mask].mean().item()
                     else:
@@ -218,24 +285,40 @@ class FPOContinuousLearner:
                     jac_diag_sat_fraction = sat_mask.float().mean().item()
 
                 if getattr(self.args, "jacobian_ratio_correction", False):
-                    diff = diff * jac_w.unsqueeze(-1).unsqueeze(-1)   # [M,N,cfm_n,1], broadcast
-
-                diff_mean = diff.mean(dim=(-2, -1))                   # [M,N]
-                mb_rho_s = th.exp(th.clamp(diff_mean, -rho_clip, rho_clip))  # [M,N]
-                # ------新增：残差幅度代理，用于诊断 exp(-x)*x -> 0 是否真的在发生 ----------
+                    diff = diff * jac_w.unsqueeze(-1)   # [M,N,cfm_n], broadcast over cfm_n
+                mb_rho_s_pt = th.exp(th.clamp(diff, -rho_clip, rho_clip))  # [M,N,cfm_n]
+                # ------残差幅度代理，用于诊断 exp(-x)*x -> 0 是否真的在发生（同样逐点，
+                # 不做 cfm_n 平均）----------
                 # sqrt(L_new) 正比于 CFM 回归残差 ||v_pred - target|| 的均方根，
                 # 是 ||∇_v_pred L_new|| 的廉价代理（无需对每个样本单独反传求参数梯度）。
                 # -----------------------------------------------------------------------------
-                cfm_residual_rms = mb_cfm_loss.mean(dim=(-2, -1)).sqrt()      # [M,N]
+                cfm_residual_rms_pt = mb_cfm_loss.squeeze(-1).sqrt()     # [M,N,cfm_n]
 
-                mb_rho_s = mb_rho_s.reshape(-1)
-                mb_advantages = mb_advantages_2d.reshape(-1)
-                cfm_residual_rms = cfm_residual_rms.reshape(-1)
+                cfm_n = mb_rho_s_pt.shape[-1]
+                mb_advantages_pt = mb_advantages_2d.unsqueeze(-1).expand(-1, -1, cfm_n)  # [M,N,cfm_n]
+
+                mb_rho_s = mb_rho_s_pt.reshape(-1)
+                mb_advantages = mb_advantages_pt.reshape(-1)
+                cfm_residual_rms = cfm_residual_rms_pt.reshape(-1)
+
+                # ------FPO++ 改动 2：A<0 时用 SPO 式平滑目标替换 PPO 硬 clip ----------
+                # psi_SPO(rho, A) = rho*A - (|A| / (2*eps_clip)) * (rho-1)^2
+                # 见类 docstring。A>=0 仍用标准 PPO clip surrogate。
+                neg_mask = mb_advantages < 0
                 surr1 = mb_rho_s * mb_advantages
                 surr2 = th.clamp(
                     mb_rho_s, 1 - self.args.eps_clip, 1 + self.args.eps_clip
                 ) * mb_advantages
-                pg_loss = -th.min(surr1, surr2).mean()
+                ppo_surr = th.min(surr1, surr2)
+                spo_surr = (
+                    mb_rho_s * mb_advantages
+                    - (mb_advantages.abs() / (2 * self.args.eps_clip))
+                    * (mb_rho_s - 1) ** 2
+                )
+                surr = th.where(neg_mask, spo_surr, ppo_surr)
+                # 最终只在这一步对 (minibatch, cfm_n) 一起取平均 -- ratio 和逐点 surrogate
+                # 本身全程没有被平均过。
+                pg_loss = -surr.mean()
                 actor_loss = pg_loss
 
                 if self.actor_optimisers is not None:
@@ -261,9 +344,7 @@ class FPOContinuousLearner:
                     mb_advantages.std(unbiased=False).item()
                 )
                 actor_stats["pg_loss"].append(pg_loss.item())
-                actor_stats["cfm_loss_mean"].append(
-                    mb_cfm_loss.mean(dim=(-2, -1)).mean().item()
-                )
+                actor_stats["cfm_loss_mean"].append(mb_cfm_loss.mean().item())
                 actor_stats["rho_s_mean"].append(mb_rho_s.mean().item())
                 actor_stats["rho_s_std"].append(mb_rho_s.std(unbiased=False).item())
                 actor_stats["clip_fraction"].append(
@@ -273,13 +354,12 @@ class FPOContinuousLearner:
                     ).float().mean().item()
                 )
                 actor_stats["actor_grad_norm"].append(grad_norm.item())
-                actor_stats["jac_diag_sat_diff_abs_mean"].append(jac_diag_sat_diff_abs_mean)
-                actor_stats["jac_diag_unsat_diff_abs_mean"].append(jac_diag_unsat_diff_abs_mean)
-                actor_stats["jac_diag_sat_fraction"].append(jac_diag_sat_fraction)
 
-                # ------新增：A<0 诊断，检验"残差变大->有效权重是否随之衰减" ----------
+                # ------A<0 诊断，检验"残差变大->有效权重是否随之衰减"（沿用 MAFPO 的
+                # 诊断定义，现在作用在逐点 ratio 上，样本量是 M*N*cfm_n 而不是 M*N，
+                # 粒度更细；unclipped_mask 只是拿旧的 clip 边界当参照系诊断用，SPO
+                # 分支本身并不真的做这个 clip）----------
                 with th.no_grad():
-                    neg_mask = mb_advantages < 0
                     unclipped_mask = (
                         (mb_rho_s >= 1 - self.args.eps_clip)
                         & (mb_rho_s <= 1 + self.args.eps_clip)
@@ -299,6 +379,9 @@ class FPOContinuousLearner:
                             (neg_mask & ~unclipped_mask).float().sum().item()
                             / neg_mask.float().sum().item()
                         )
+                    actor_stats["jac_diag_sat_diff_abs_mean"].append(jac_diag_sat_diff_abs_mean)
+                    actor_stats["jac_diag_unsat_diff_abs_mean"].append(jac_diag_unsat_diff_abs_mean)
+                    actor_stats["jac_diag_sat_fraction"].append(jac_diag_sat_fraction)
                 # -----------------------------------------------------------------------------
 
         self.critic_training_steps += 1
@@ -313,6 +396,13 @@ class FPOContinuousLearner:
             self._update_targets_soft(self.args.target_update_interval_or_tau)
 
         if t_env - self.log_stats_t >= self.args.learner_log_interval:
+            self.logger.log_stat("action_at_bound_fraction", action_at_bound_fraction, t_env)
+            self.logger.log_stat(
+                "agents_same_action_fraction", agents_same_action_fraction, t_env
+            )
+            self.logger.log_stat(
+                "agents_all_same_action_fraction", agents_all_same_action_fraction, t_env
+            )
             for key in ["critic_loss", "critic_grad_norm", "td_error_abs",
                         "value_mean", "target_mean"]:
                 self.logger.log_stat(key, self._mean_stat(critic_train_stats[key]), t_env)
@@ -416,8 +506,8 @@ class FPOContinuousLearner:
         #
         # action_raw (sigmoid 之前的无界积分终点), 不是执行动作 -- interpolating
         # toward the post-sigmoid action would reintroduce the exact boundary-
-        # squash regression problem sigmoid was meant to fix (见
-        # fpo_actor.py 顶部注释)。
+        # squash regression problem sigmoid was meant to fix (see
+        # fpo_actor.py's top-of-file comment).
         action = batch["action_raw"][:, :-1].float().reshape(
             -1, self.n_agents, self.n_actions
         )

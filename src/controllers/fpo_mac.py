@@ -7,6 +7,11 @@ from modules.agents import REGISTRY as agent_REGISTRY
 
 #------新增：FPO 专用 MAC，调用 FPOActor.sample_action() 采样，并计算 initial_cfm_loss----------
 #-----------------------------
+# 2026-08-25 修改：配合 fpo_actor.py 的 hard clamp -> sigmoid，self._last_x1_raw
+# 存的是 sigmoid 之前的无界积分终点，供 compute_initial_cfm_loss /
+# parallel_runner.py 的 collect_action_raw 读取，让 CFM 回归的插值目标是无界
+# latent，不是 sigmoid 之后被压缩过的 action。
+#-----------------------------
 
 
 class FPOMAC:
@@ -49,24 +54,31 @@ class FPOMAC:
             eps = th.zeros(*h.shape[:-1], n_act, device=h.device)
             n_steps = getattr(self.args, "cfm_rollout_steps", 1)
             x1 = self.integrate(h, eps, n_steps)
-            action = th.clamp(x1, 0.0, 1.0)
+            action = th.sigmoid(x1)
             self._last_eps = eps
+            self._last_x1_raw = x1
         else:
             if self.individual_agents:
                 h = self._encode(inputs, self.hidden_states, B)
                 n_act = self.args.n_actions
                 eps = th.randn(*h.shape[:-1], n_act, device=h.device)
                 n_steps = getattr(self.args, "cfm_rollout_steps", 1)
-                action = th.clamp(self.integrate(h, eps, n_steps), 0.0, 1.0)
+                x1 = self.integrate(h, eps, n_steps)
+                action = th.sigmoid(x1)
                 self.hidden_states = h
                 self._last_eps = eps
+                self._last_x1_raw = x1
             else:
-                action, self.hidden_states, self._last_eps = self.agent.sample_action(
-                    inputs, self.hidden_states
-                )
+                (
+                    action,
+                    self.hidden_states,
+                    self._last_eps,
+                    self._last_x1_raw,
+                ) = self.agent.sample_action(inputs, self.hidden_states)
 
-        # action: [B*N, n_actions] → [B, N, n_actions]
+        # action / x1_raw: [B*N, n_actions] → [B, N, n_actions]
         action = action.view(B, self.n_agents, -1)
+        self._last_x1_raw = self._last_x1_raw.view(B, self.n_agents, -1)
         return action[bs]
 
     # ── learner forward（返回 h 供 CFM loss 计算）────────────────────────────

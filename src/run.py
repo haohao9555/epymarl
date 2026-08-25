@@ -193,7 +193,10 @@ def run_sequential(args, logger):
     else:
         scheme["reward"] = {"vshape": (args.n_agents,)}
     #---------------新增：FPO batch 字段------------------------------
-    if args.runner == "fpo_episode" or args.learner in ("fpo_learner", "fpo_continuous_learner", "fpo_discrete_learner"):
+    if args.runner == "fpo_episode" or args.learner in (
+        "fpo_learner", "fpo_continuous_learner", "fpo_discrete_learner",
+        "fpopp_continuous_learner", "fpopp_shared_continuous_learner",
+    ):
         args.cfm_n_samples = getattr(args, "cfm_n_samples", 1)
         args.cfm_action_dim = getattr(args, "cfm_action_dim", args.n_actions)
         scheme["cfm_eps"] = {
@@ -206,6 +209,14 @@ def run_sequential(args, logger):
         }
         scheme["initial_cfm_loss"] = {
             "vshape": (args.cfm_n_samples, 1),
+            "group": "agents",
+        }
+        # 2026-08-25 新增：fpo_actor.py 从 hard clamp 换成 sigmoid 之后，CFM 回归
+        # 的插值目标是 sigmoid 之前的无界终点 x1（self.mac._last_x1_raw），不是
+        # 执行动作本身——这里存下来供训练时读取（parallel_runner.py 的
+        # collect_action_raw 负责写入）。
+        scheme["action_raw"] = {
+            "vshape": (args.cfm_action_dim,),
             "group": "agents",
         }
     #----------------------
@@ -291,7 +302,10 @@ def run_sequential(args, logger):
     record_mov_steps = sorted(int(t) for t in getattr(args, "record_mov_timesteps", []))
     recorded_mov_steps = set()
 
-    is_fpo_transition_batch = args.learner in ("fpo_continuous_learner", "fpo_discrete_learner")
+    is_fpo_transition_batch = args.learner in (
+        "fpo_continuous_learner", "fpo_discrete_learner",
+        "fpopp_continuous_learner", "fpopp_shared_continuous_learner",
+    )
     fpo_rollout_timesteps = getattr(args, "fpo_rollout_timesteps", 2048)
     fpo_collected_timesteps = 0
 

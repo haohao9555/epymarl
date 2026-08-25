@@ -7,6 +7,7 @@ from .maddpg_ns import MADDPGCriticNS
 from .ac import ACCritic
 from .ac_ns import ACCriticNS
 from .fpo_critic import CentralVCritic as FPOCritic
+from .fpo_shared_critic import SharedVCritic as FPOSharedCritic
 
 
 REGISTRY = {}
@@ -20,6 +21,7 @@ REGISTRY["maddpg_critic_ns"] = MADDPGCriticNS
 REGISTRY["ac_critic"] = ACCritic
 REGISTRY["ac_critic_ns"] = ACCriticNS
 REGISTRY["fpo_critic"] = FPOCritic
+REGISTRY["fpo_shared_critic"] = FPOSharedCritic
 
 
 def register_pac_critics():

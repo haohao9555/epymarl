@@ -24,6 +24,12 @@ cfm_target_type: "velocity"
 # Euler integration steps for rollout/eval sampling (t=0 -> t=1).
 cfm_rollout_steps: 10
 
+# actor uses sigmoid (not hard clamp), so the CFM regression target is the
+# unbounded x1_raw -- the velocity network's output must stay bounded or
+# cfm_loss_mean diverges over long runs (see fpo_actor.py velocity()'s comment).
+cfm_velocity_bound: 8.0
+jacobian_ratio_correction: True
+
 # Shuffle the collected rollout transitions and train for 10 passes.
 fpo_minibatch_size: 256
 epochs: 4

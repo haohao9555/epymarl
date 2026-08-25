@@ -80,6 +80,10 @@ class ParallelRunner:
         self.collect_cfm = all(
             key in scheme for key in ("cfm_eps", "cfm_t", "initial_cfm_loss")
         )
+        # 2026-08-25 新增：fpo_actor.py 换成 sigmoid 之后，MAC 会把 sigmoid 之前
+        # 的无界积分终点存成 self.mac._last_x1_raw；这里独立于 collect_cfm 存进
+        # buffer，供训练时的 CFM 回归用（插值目标改成 action_raw，不是执行动作）。
+        self.collect_action_raw = "action_raw" in scheme
 
     def sample_cfm_points(self, batch_size):
         return (
@@ -170,10 +174,12 @@ class ParallelRunner:
                     {
                         "cfm_eps": cfm_eps.unsqueeze(1),
                         "cfm_t": cfm_t.unsqueeze(1),
+                        # phi_hat (self.mac._last_x1_raw): sigmoid 之前的无界终点，
+                        # 不是压过的 action -- 见 fpo_actor.py/fpo_mac.py 的注释。
                         "initial_cfm_loss": self.mac.compute_initial_cfm_loss(
                             cfm_eps,
                             cfm_t,
-                            actions,
+                            self.mac._last_x1_raw[envs_not_terminated],
                             bs=envs_not_terminated,
                         ).unsqueeze(1),
                     }
