@@ -1,0 +1,105 @@
+# --- FPO++，连续（Box(0,1)）动作空间，共享网络预设 ---
+# 所有 agent 共用一个 actor（只靠 obs_agent_id one-hot 区分），一个联合优化
+# 器/梯度裁剪，一个全局 anchor/reflow 惩罚，critic 是单一联合 V(s)，把同一个
+# advantage 广播给所有 agent。ratio/surrogate 数学和完整的 config 轴说明见
+# fpopp_learner.py 的 docstring；fpopp.yaml 是同一个 learner 的
+# individual-actor 预设。
+#
+# critic_type: mafpo_shared_critic 完全没有 agent 条件化
+# （SharedVCritic.per_agent_values=False），所以 learner 用一个宽度为 1 的
+# advantage 广播给所有 agent——这要求 common_reward=True（在 learner 的
+# __init__ 里会 assert）。
+
+runner: "parallel"
+mac: "mafpo_mac"
+agent: "mafpo_actor"
+learner: "fpopp_learner"
+critic_type: "mafpo_shared_critic"
+fpo_individual_agents: False
+# 共享 actor 不管 fpo_actor_optim_per_agent 怎么设都只会有一个 Adam/一次裁
+# 剪（这个开关对它是 no-op）；fpo_anchor_per_agent 设成 False 保持一致（对全
+# 局均值算一个 hinge）——想在共享 actor 上也用逐 agent 的 anchor 就把它改成
+# True。显式写出来（不留给 getattr 默认值），这样 sacred 才允许从命令行覆盖。
+fpo_actor_optim_per_agent: False
+fpo_anchor_per_agent: False
+
+# 用子进程并行跑多个独立环境。
+batch_size_run: 8
+
+# 攒够大约 fpo_rollout_timesteps 步 transition（凑齐完整 episode）之后，训
+# 练一次再清空 buffer。
+buffer_size: 128
+batch_size: 8
+fpo_rollout_timesteps: 2048
+
+# 每个 transition 存这么多个固定的 CFM 邻域探测点（ratio 的蒙特卡洛采样数）。
+cfm_n_samples: 50
+# exp() 之前 log-ratio 的上界（STE clamp，见 fpopp_learner.py），rho_s 的范
+# 围因此是 (0, exp(cfm_rho_clip)]。
+cfm_rho_clip: 0.3
+cfm_target_type: "velocity"
+
+# 算 ratio 的 diff 之前，old/new 单点 CFM MSE 各自先夹一个上界（new 侧是
+# STE），防止一个离群探测点主导梯度。只影响算 diff 用的局部副本；mb_cfm_loss
+# 本身、anchor_loss、reflow_loss、cfm_loss_mean* 诊断看到的都是原始未截断的
+# 值。
+cfm_loss_clip_max: 3.0
+
+# rollout/eval 采样时 Euler 积分的步数（t=0 -> t=1）。
+cfm_rollout_steps: 10
+
+# actor 用 sigmoid（不是硬 clamp），所以 CFM 回归目标是无界的 x1_raw——速度
+# 网络的输出要用 tanh 限幅到 [-cfm_velocity_bound, cfm_velocity_bound]，否则
+# cfm_loss_mean 长跑会发散（见 mafpo_actor.py 的 velocity()）。
+cfm_velocity_bound: 8.0
+
+# anchor：CFM 回归误差超过 cfm_anchor_threshold 时启动的 hinge-squared 惩
+# 罚，系数 cfm_anchor_coef（0 = 完全关闭）。默认关闭——不属于 FPO/FPO++ 的核
+# 心 ratio 数学，只有 cfm_loss_clip_max + advantage normalize/clamp +
+# grad_norm_clip 还不够用时才作为额外的稳定性手段打开。
+cfm_anchor_threshold: 2.0
+cfm_anchor_coef: 0.0
+
+# reflow：Rectified Flow 自蒸馏直线度正则，跟 anchor 是两个独立开关（可以只
+# 开一个、都开、或都不开）。同一套 hinge-squared 结构：
+# reflow_loss = cfm_reflow_coef * [max(0, L_reflow - cfm_reflow_threshold)]^2
+cfm_reflow_threshold: 0.01
+cfm_reflow_coef: 0.0
+
+# 打乱收集到的 rollout transition，训练 epochs 遍。
+fpo_minibatch_size: 512
+epochs: 2
+
+# 这个 learner 不读这个 key（GAE baseline 用 rollout 时的 critic，没有
+# target 网络）——留着是因为 default.yaml 里其它算法还在用它。
+target_update_interval_or_tau: 0.01
+
+# advantage 在整个有效 rollout 内 normalize（均值 0、标准差 1）之后的 clamp
+# 范围，见 fpopp_learner.py 的 _compute_advantages_and_targets。
+adv_clip: 5.0
+
+# PPO2 式 value clip，见 fpopp.yaml 里的说明。<=0 关闭。
+value_clip_eps: 0.2
+
+lr: 0.00003   # actor 和 critic 的优化器都用这个学习率
+grad_norm_clip: 10
+hidden_dim: 128
+
+obs_agent_id: True
+obs_last_action: False
+obs_individual_obs: False
+
+use_rnn: True
+standardise_returns: True
+standardise_rewards: True
+gae_lambda: 0.95
+eps_clip: 0.05
+name: "fpopp_shared"
+
+use_wandb: True
+wandb_team: "adolf9555-university-of-technology-sydney"
+wandb_project: "MAFPO++"
+wandb_run_name: "MAFPO++-shared-MPE"
+wandb_mode: "online"
+
+t_max: 20050000

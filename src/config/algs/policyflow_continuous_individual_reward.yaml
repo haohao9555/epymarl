@@ -1,10 +1,12 @@
-# --- Continuous MAFPO/FPO with individual per-agent rewards ---
+# --- Continuous PolicyFlow with individual per-agent rewards ---
+# Renamed from mafpo_continuous_individual_reward.yaml/fpo_* -- see
+# policyflow_continuous.yaml for the lineage-split rationale.
 
 runner: "parallel"
-mac: "fpo_mac"
-agent: "fpo_actor"
-learner: "fpo_continuous_learner"
-critic_type: "fpo_critic"
+mac: "policyflow_mac"
+agent: "policyflow_actor"
+learner: "policyflow_continuous_learner"
+critic_type: "policyflow_critic"
 
 # Keep each agent's reward separate instead of summing to a common team reward.
 common_reward: False
@@ -65,12 +67,12 @@ entropy_n_samples: 4
 # lambda_trust values but never got below ~39-55% action_at_bound_fraction).
 lambda_trust: 0.0
 
-name: "mafpo_continuous_individual_reward"
+name: "policyflow_continuous_individual_reward"
 
 use_wandb: True
 wandb_team: "adolf9555-university-of-technology-sydney"
 wandb_project: "MPE continuous algorithm"
-wandb_run_name: "MAFPO-MPE"
+wandb_run_name: "PolicyFlow-MPE"
 wandb_mode: "online"
 
 t_max: 20050000

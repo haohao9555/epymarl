@@ -2,12 +2,14 @@ import torch as th
 
 from modules.agents import REGISTRY as agent_REGISTRY
 
-#------新增：FPO 专用 MAC，调用 FPOActor.sample_action() 采样，并计算 initial_cfm_loss----------
+#------PolicyFlow 专用 MAC，调用 PolicyFlowActor.sample_action() 采样，并计算 initial_cfm_loss----------
+# 原 fpo_mac.py/FPOMAC 重命名而来，跟 GitHub 上独立演化的 MAFPO 线（见
+# mafpo_mac.py）分开维护。
 #-----------------------------
 
 
-class FPOMAC:
-    """FPO 多智能体控制器。
+class PolicyFlowMAC:
+    """PolicyFlow 多智能体控制器。
 
     与 ContinuousMAC 的区别:
       - select_actions(): 调用 agent.sample_action()，通过 K 步 Euler flow 产生动作

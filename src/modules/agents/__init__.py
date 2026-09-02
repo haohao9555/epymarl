@@ -5,8 +5,12 @@ from .rnn_feature_agent import RNNFeatureAgent
 # ------ 新增：注册连续动作 Agent ----------
 # -----------------------------------------------------------------------------
 from .rnn_continuous_agent import RNNContinuousAgent
-from .fpo_actor import FPOActor
-from .fpo_discrete_agent import FPODiscreteAgent
+from .policyflow_actor import PolicyFlowActor
+# -----------------------------------------------------------------------------
+
+# ------ 新增：MAFPO（GitHub 独立演化线，individual actors，见 mafpo_actor.py）----------
+# -----------------------------------------------------------------------------
+from .mafpo_actor import MAFPOActor
 # -----------------------------------------------------------------------------
 
 REGISTRY = {}
@@ -17,6 +21,6 @@ REGISTRY["rnn_feat"] = RNNFeatureAgent
 # ------ 新增 ----------
 # -----------------------------------------------------------------------------
 REGISTRY["rnn_continuous"] = RNNContinuousAgent
-REGISTRY["fpo_actor"] = FPOActor
-REGISTRY["fpo_discrete_agent"] = FPODiscreteAgent
+REGISTRY["policyflow_actor"] = PolicyFlowActor
+REGISTRY["mafpo_actor"] = MAFPOActor
 # -----------------------------------------------------------------------------

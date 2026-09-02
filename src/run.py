@@ -192,26 +192,36 @@ def run_sequential(args, logger):
         scheme["reward"] = {"vshape": (1,)}
     else:
         scheme["reward"] = {"vshape": (args.n_agents,)}
-    #---------------新增：FPO batch 字段------------------------------
-    if args.runner == "fpo_episode" or args.learner in ("fpo_learner", "fpo_continuous_learner", "fpo_discrete_learner"):
+    #---------------新增：FPO/PolicyFlow/MAFPO batch 字段------------------------------
+    # policyflow_continuous_learner = 本仓库本地开发的 exact-Gaussian-ratio 线
+    # （原 fpo_continuous_learner，见其 docstring）；fpopp_learner = 从 GitHub
+    # 拉取的 individual-actors 线（原 mafpo_continuous_learner，已删除，见
+    # fpopp_learner.py 的 docstring）fork 改进 ratio 数学而来。两者都还是
+    # cfm-loss-diff 机制的调用方，共用这段 buffer 字段搭建逻辑，但
+    # action_raw/action_noise/z 只有 PolicyFlow 的 MAC 会产出（见下方）。
+    if args.learner in (
+        "policyflow_continuous_learner", "fpopp_learner",
+    ):
         args.cfm_n_samples = getattr(args, "cfm_n_samples", 1)
         args.cfm_action_dim = getattr(args, "cfm_action_dim", args.n_actions)
 
         # cfm_eps/cfm_t/initial_cfm_loss are the OLD FPO ratio mechanism's own
         # neighbourhood-probe fields (cfm-loss-difference ratio, see
-        # fpo_continuous_learner's class docstring). The active PolicyFlow
-        # ratio (use_policyflow_ratio=True, continuous learner only) never
-        # reads any of them -- delta_v and brownian_loss are both built from
-        # the real rollout z/action_raw below and a t-grid computed at train
-        # time, not stored per-timestep. Skipping construction here saves a
-        # rollout-time velocity() call per (env-step, cfm_n sample), buffer
-        # memory, and multiprocessing transfer -- see parallel_runner.py's
-        # collect_cfm flag, which is driven entirely by whether these keys
-        # are present in the scheme. Still needed for fpo_discrete_learner/
-        # fpo_learner and for the continuous learner's old-ratio fallback
+        # policyflow_continuous_learner's class docstring). The active
+        # PolicyFlow ratio (use_policyflow_ratio=True, policyflow_continuous_
+        # learner only) never reads any of them -- delta_v and brownian_loss
+        # are both built from the real rollout z/action_raw below and a
+        # t-grid computed at train time, not stored per-timestep. Skipping
+        # construction here saves a rollout-time velocity() call per
+        # (env-step, cfm_n sample), buffer memory, and multiprocessing
+        # transfer -- see parallel_runner.py's collect_cfm flag, which is
+        # driven entirely by whether these keys are present in the scheme.
+        # Still needed for fpopp_learner (which has no PolicyFlow-ratio
+        # option at all) and for
+        # policyflow_continuous_learner's own old-ratio fallback
         # (use_policyflow_ratio=False).
         use_pf_ratio = (
-            args.learner == "fpo_continuous_learner"
+            args.learner == "policyflow_continuous_learner"
             and getattr(args, "use_policyflow_ratio", False)
         )
         if not use_pf_ratio:
@@ -227,30 +237,42 @@ def run_sequential(args, logger):
                 "vshape": (args.cfm_n_samples, 1),
                 "group": "agents",
             }
-        # Pre-clamp integration endpoint, for diagnosing whether actions pinned
-        # at the [0,1] boundary are just-barely-there or wildly overshooting.
-        scheme["action_raw"] = {
-            "vshape": (args.cfm_action_dim,),
-            "group": "agents",
-        }
-        # Real injected Gaussian noise n ~ N(0,sigma^2), saved separately from
-        # the clamped action -- once clamp() actually truncates a sample,
-        # (action - action_raw) is no longer the true Gaussian draw, so the
-        # PolicyFlow ratio's likelihood term needs this exact value, not a
-        # reconstruction from the post-clamp action.
-        scheme["action_noise"] = {
-            "vshape": (args.cfm_action_dim,),
-            "group": "agents",
-        }
-        # The real z (flow's t=0 starting point) that generated this rollout's
-        # action, saved so the PolicyFlow ratio's delta_v can be estimated by
-        # interpolating along the true z->phi_hat path instead of the separate
-        # cfm_eps neighborhood samples (paper's own design; cfm_eps is a
-        # different, additional set of points used only for the CFM loss).
-        scheme["z"] = {
-            "vshape": (args.cfm_action_dim,),
-            "group": "agents",
-        }
+        # action_raw: both PolicyFlowMAC and MAFPOMAC (2026-08-24: MAFPOActor
+        # switched from hard clamp to sigmoid, see its top-of-file comment)
+        # keep the pre-sigmoid/pre-clamp unbounded integration endpoint
+        # around as _last_x1_raw, so both learners' CFM regression can
+        # interpolate toward that instead of the squashed executed action.
+        if args.learner in ("policyflow_continuous_learner", "fpopp_learner"):
+            scheme["action_raw"] = {
+                "vshape": (args.cfm_action_dim,),
+                "group": "agents",
+            }
+        # action_noise/z are PolicyFlow-ratio-specific bookkeeping -- only
+        # PolicyFlowMAC's sample_action() populates them (learnable sigma
+        # terminal noise + the exact z that generated the endpoint).
+        # MAFPOMAC has no terminal-noise term at all, so adding these for
+        # fpopp_learner would crash parallel_runner.py's collect_pf_fields
+        # block (which expects all three together).
+        if args.learner == "policyflow_continuous_learner":
+            # Real injected Gaussian noise n ~ N(0,sigma^2), saved separately
+            # from the clamped action -- once clamp() actually truncates a
+            # sample, (action - action_raw) is no longer the true Gaussian
+            # draw, so the PolicyFlow ratio's likelihood term needs this
+            # exact value, not a reconstruction from the post-clamp action.
+            scheme["action_noise"] = {
+                "vshape": (args.cfm_action_dim,),
+                "group": "agents",
+            }
+            # The real z (flow's t=0 starting point) that generated this
+            # rollout's action, saved so the PolicyFlow ratio's delta_v can
+            # be estimated by interpolating along the true z->phi_hat path
+            # instead of the separate cfm_eps neighborhood samples (paper's
+            # own design; cfm_eps is a different, additional set of points
+            # used only for the CFM loss).
+            scheme["z"] = {
+                "vshape": (args.cfm_action_dim,),
+                "group": "agents",
+            }
     #----------------------
     groups = {"agents": args.n_agents}
     # ------ 改：连续动作不需要 one-hot 预处理，离散保持原逻辑 ----------
@@ -342,7 +364,9 @@ def run_sequential(args, logger):
     record_mov_steps = sorted(record_mov_steps)
     recorded_mov_steps = set()
 
-    is_fpo_transition_batch = args.learner in ("fpo_continuous_learner", "fpo_discrete_learner")
+    is_fpo_transition_batch = args.learner in (
+        "policyflow_continuous_learner", "fpopp_learner",
+    )
     fpo_rollout_timesteps = getattr(args, "fpo_rollout_timesteps", 2048)
     fpo_collected_timesteps = 0
 

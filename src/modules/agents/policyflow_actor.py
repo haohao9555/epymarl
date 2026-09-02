@@ -2,11 +2,14 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 
-#------新增：FPO 独立 Actor 网络（速度场）----------
+#------PolicyFlow 独立 Actor 网络（速度场）----------
+# 原 fpo_actor.py/FPOActor 重命名而来：这是本仓库里更完整的 PolicyFlow-ratio
+# 版本（exact Gaussian ratio + sigma 探索噪声 + Brownian/entropy 机制），跟
+# GitHub 上更精简的 MAFPO 独立演化线（见 mafpo_actor.py）分开维护，互不影响。
 #-----------------------------
 
 
-class FPOActor(nn.Module):
+class PolicyFlowActor(nn.Module):
     """独立 Actor 网络，输出速度场 v(h, x_t, t)，用于 CFM。
 
     结构:

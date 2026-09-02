@@ -77,25 +77,36 @@ class ParallelRunner:
         self.scheme = scheme
         self.groups = groups
         self.preprocess = preprocess
-        # Two independent flags, driven entirely by which fields run.py put in
+        # Independent flags, driven entirely by which fields run.py put in
         # the scheme: collect_cfm covers the OLD FPO ratio mechanism's own
         # neighbourhood-probe fields (skipped entirely when
         # use_policyflow_ratio=True, since that ratio never reads them --
-        # see run.py's scheme setup); collect_pf_fields covers what the
-        # active PolicyFlow ratio actually needs (z/action_raw/action_noise),
-        # which must keep being collected independently of collect_cfm.
+        # see run.py's scheme setup); collect_action_raw covers the
+        # pre-sigmoid/pre-clamp unbounded integration endpoint any CFM-based
+        # MAC keeps around as self.mac._last_x1_raw (both PolicyFlowMAC and
+        # MAFPOMAC as of 2026-08-24 -- see mafpo_actor.py's top-of-file
+        # comment); collect_pf_fields covers what's PolicyFlow-ratio-specific
+        # on top of that (z/action_noise, the learnable-sigma terminal noise
+        # bookkeeping MAFPOMAC has no equivalent of). All three are
+        # independent of each other.
         self.collect_cfm = all(
             key in scheme for key in ("cfm_eps", "cfm_t", "initial_cfm_loss")
         )
+        self.collect_action_raw = "action_raw" in scheme
         self.collect_pf_fields = all(
-            key in scheme for key in ("action_raw", "action_noise", "z")
+            key in scheme for key in ("action_noise", "z")
         )
 
     def sample_cfm_points(self, batch_size):
         return (
             # cfm_eps: neighbourhood probe points in z-space, must match the
             # actor's actual base distribution (N(0,I), see fpo_actor.py) so
-            # the CFM loss trains v on plausible eps values.
+            # the CFM loss trains v on plausible eps values. Each of the
+            # cfm_n_samples probes gets its own independent N(0,I) draw.
+            # This is separate from the actor's own rollout-time eps (which
+            # produces the executed action, and is 0 only at test_mode) --
+            # cfm_eps only ever feeds the CFM ratio's probe points, never an
+            # executed action.
             th.randn(
                 batch_size,
                 self.args.n_agents,
@@ -103,9 +114,13 @@ class ParallelRunner:
                 self.args.cfm_action_dim,
                 device=self.batch.device,
             ),
-            # cfm_t: interpolation time, always Uniform(0,1) regardless of
-            # the base distribution's shape.
-            th.rand(
+            # cfm_t: interpolation time, Uniform(0,1) regardless of the base
+            # distribution's shape, but scaled into [0.005, 0.995] so it never
+            # lands exactly on the t=0/t=1 boundary -- x_t degenerates to pure
+            # eps or pure action there, which is numerically fragile for the
+            # velocity network. Matches FPO++ 官方实现的 padding
+            # (isaaclab_fpo/algorithms/fpo.py, beta=1 时退化成同一个式子)。
+            0.005 + 0.99 * th.rand(
                 batch_size,
                 self.args.n_agents,
                 self.args.cfm_n_samples,
@@ -185,24 +200,26 @@ class ParallelRunner:
                     {
                         "cfm_eps": cfm_eps.unsqueeze(1),
                         "cfm_t": cfm_t.unsqueeze(1),
-                        # phi_hat (self.mac._last_x1_raw), not the noisy
-                        # executed action -- see fpo_continuous_learner's
-                        # _compute_cfm_loss_for_time_indices comment: the flow
-                        # is trained on z->phi only, noise stays separate.
+                        # phi_hat (self.mac._last_x1_raw) -- both PolicyFlowMAC
+                        # and MAFPOMAC keep this pre-sigmoid/pre-clamp
+                        # unbounded endpoint around now; the getattr fallback
+                        # to the plain executed action only matters for a MAC
+                        # that predates that convention.
                         "initial_cfm_loss": self.mac.compute_initial_cfm_loss(
                             cfm_eps,
                             cfm_t,
-                            self.mac._last_x1_raw[envs_not_terminated],
+                            getattr(self.mac, "_last_x1_raw", actions)[envs_not_terminated],
                             bs=envs_not_terminated,
                         ).unsqueeze(1),
                     }
                 )
+            if self.collect_action_raw:
+                actions_chosen["action_raw"] = (
+                    self.mac._last_x1_raw[envs_not_terminated].detach().unsqueeze(1)
+                )
             if self.collect_pf_fields:
                 actions_chosen.update(
                     {
-                        "action_raw": self.mac._last_x1_raw[envs_not_terminated]
-                        .detach()
-                        .unsqueeze(1),
                         "action_noise": self.mac._last_noise[envs_not_terminated]
                         .detach()
                         .unsqueeze(1),

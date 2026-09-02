@@ -8,8 +8,13 @@ from components.standarize_stream import RunningMeanStd
 from modules.critics import REGISTRY as critic_registry
 
 
-class FPOContinuousLearner:
-    """Continuous FPO learner.
+class PolicyFlowContinuousLearner:
+    """Continuous PolicyFlow learner (renamed from FPOContinuousLearner /
+    fpo_continuous_learner.py). This is the full exact-Gaussian-ratio +
+    Brownian/entropy-mechanism lineage developed in this repo; the plainer
+    cfm-loss-diff-ratio + individual-actors lineage pulled in from GitHub
+    lives separately as MAFPOContinuousLearner (mafpo_continuous_learner.py)
+    and evolves independently -- the two are deliberately not merged.
 
     The rollout policy stores fixed CFM eps/t/action points. By default
     (use_policyflow_ratio=False) we recompute the current CFM loss at those

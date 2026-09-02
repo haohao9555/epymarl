@@ -1,10 +1,14 @@
-# --- Continuous MAFPO/FPO parameters for Box(0, 1) action spaces ---
+# --- Continuous PolicyFlow parameters for Box(0, 1) action spaces ---
+# Renamed from mafpo_continuous.yaml/fpo_*: this is the exact-Gaussian-ratio
+# + Brownian/entropy-mechanism lineage developed in this repo. The plainer
+# lineage pulled in from GitHub (individual actors, cfm-loss-diff ratio) now
+# lives separately as mafpo_continuous.yaml and evolves independently.
 
 runner: "parallel"
-mac: "fpo_mac"
-agent: "fpo_actor"
-learner: "fpo_continuous_learner"
-critic_type: "fpo_critic"
+mac: "policyflow_mac"
+agent: "policyflow_actor"
+learner: "policyflow_continuous_learner"
+critic_type: "policyflow_critic"
 
 # Collect independent environments in subprocesses under one training run.
 batch_size_run: 8
@@ -174,12 +178,12 @@ test_add_noise: False
 # docstring for the full derivation. First test of this mechanism.
 use_policyflow_ratio: True
 
-name: "mafpo_continuous"
+name: "policyflow_continuous"
 
 use_wandb: True
 wandb_team: "adolf9555-university-of-technology-sydney"
 wandb_project: "MPE continuous algorithm"
-wandb_run_name: "MAFPO-MPE"
+wandb_run_name: "PolicyFlow-MPE"
 wandb_mode: "online"
 
 # Best-effort evaluation recordings. Recording failures are logged and skipped.

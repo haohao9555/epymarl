@@ -5,6 +5,7 @@ env_args:
   time_limit: 100
   pretrained_wrapper: null
   continuous_actions: True
+  N: 3 # pz-mpe scenarios' agent/landmark count; override to 1 for single-agent runs
 
 test_greedy: True
 test_nepisode: 100

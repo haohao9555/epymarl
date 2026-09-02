@@ -117,6 +117,19 @@ class GymmaWrapper(MultiAgentEnv):
 
         if isinstance(done, Iterable):
             done = all(done)
+        if isinstance(truncated, Iterable):
+            truncated = all(truncated)
+
+        # ------修复：把 per-step 的 "episode_limit" 布尔标记塞进 info ----------
+        # runners/parallel_runner.py 和 runners/episode_runner.py 都靠
+        # info.get("episode_limit", False) 来判断某一步的 terminated 是不是
+        # 单纯因为撞到了 time limit（而不是真正结束）——这是从 SMAC/PyMARL
+        # 沿用下来的约定（真正结束时 GAE 不 bootstrap，撞时限时要 bootstrap）。
+        # gymma 这一层之前从没设置过这个 key，导致所有经 gymma 路由的
+        # continuing 任务（pz-mpe-simple-spread、lbforaging、rware…）一旦
+        # 超时截断，都被当成了真正的 episode 终止。这里用本步的 truncated
+        # 直接标记；self.episode_limit 本身（构造时存的最大步数）不受影响。
+        self._info["episode_limit"] = bool(truncated)
         return self._obs, reward, done, truncated, self._info
 
     def get_obs(self):
