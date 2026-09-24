@@ -1,0 +1,18 @@
+# MaMuJoCo（Gymnasium-Robotics mamujoco_v1），经 envs/mamujoco_wrapper.py 走
+# gymma。key 形如 mamujoco-<Scenario>-<agent_conf>，见 wrapper 底部的注册表。
+# 不放 N / continuous_actions 这类 MPE 专用 kwarg（会被原样传给 env 构造）。
+env: "gymma"
+
+env_args:
+  key: "mamujoco-HalfCheetah-2x3"
+  time_limit: 1000       # 跟 mamujoco 内部 1000 步 truncation 一致
+  pretrained_wrapper: null
+  agent_obsk: 1          # 每个 agent 观测到 k 跳邻域内的关节（官方默认 1）
+
+test_greedy: True
+test_nepisode: 16
+test_interval: 50000
+log_interval: 50000
+runner_log_interval: 10000
+learner_log_interval: 10000
+t_max: 10050000

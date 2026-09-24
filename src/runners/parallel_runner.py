@@ -96,24 +96,43 @@ class ParallelRunner:
         self.collect_pf_fields = all(
             key in scheme for key in ("action_noise", "z")
         )
+        # ADER: flow_z/flow_k are only in the scheme when
+        # learner==fpopp_learner and ader_enabled=True (see run.py). Same
+        # flag also gates scaling the CFM neighbourhood probes below by the
+        # current agent-wise k -- when ADER is off this stays exactly the
+        # old N(0,I) behaviour.
+        self.collect_ader_fields = all(
+            key in scheme for key in ("flow_z", "flow_k")
+        )
 
-    def sample_cfm_points(self, batch_size):
+    def sample_cfm_points(self, batch_size, bs=None):
+        cfm_eps = th.randn(
+            batch_size,
+            self.args.n_agents,
+            self.args.cfm_n_samples,
+            self.args.cfm_action_dim,
+            device=self.batch.device,
+        )
+        # ADER: the 50 CFM probes must be scaled by the same frozen
+        # per-agent k the real rollout used for this transition (mac._last_k,
+        # set inside select_actions right before this is called) -- not an
+        # independent draw. current_k: [active_B,N,1] -> unsqueeze(2) ->
+        # [active_B,N,1,1], broadcasts over both the cfm_n and action-dim
+        # axes of cfm_eps. We only need cfm_eps itself (not the raw z_cfm)
+        # since old/new CFM loss are both computed straight from cfm_eps.
+        if self.collect_ader_fields and bs is not None:
+            current_k = self.mac._last_k[bs].to(self.batch.device)   # [B,N,1]
+            cfm_eps = cfm_eps * current_k.unsqueeze(2)
         return (
             # cfm_eps: neighbourhood probe points in z-space, must match the
-            # actor's actual base distribution (N(0,I), see fpo_actor.py) so
-            # the CFM loss trains v on plausible eps values. Each of the
-            # cfm_n_samples probes gets its own independent N(0,I) draw.
-            # This is separate from the actor's own rollout-time eps (which
-            # produces the executed action, and is 0 only at test_mode) --
-            # cfm_eps only ever feeds the CFM ratio's probe points, never an
-            # executed action.
-            th.randn(
-                batch_size,
-                self.args.n_agents,
-                self.args.cfm_n_samples,
-                self.args.cfm_action_dim,
-                device=self.batch.device,
-            ),
+            # actor's actual base distribution (N(0,I), or N(0,k_i^2) under
+            # ADER, see fpo_actor.py) so the CFM loss trains v on plausible
+            # eps values. Each of the cfm_n_samples probes gets its own
+            # independent draw. This is separate from the actor's own
+            # rollout-time eps (which produces the executed action, and is 0
+            # only at test_mode) -- cfm_eps only ever feeds the CFM ratio's
+            # probe points, never an executed action.
+            cfm_eps,
             # cfm_t: interpolation time, Uniform(0,1) regardless of the base
             # distribution's shape, but scaled into [0.005, 0.995] so it never
             # lands exactly on the t=0/t=1 boundary -- x_t degenerates to pure
@@ -195,7 +214,9 @@ class ParallelRunner:
             # under the rollout policy that generated this transition.
             actions_chosen = {"actions": actions.detach().unsqueeze(1)}
             if self.collect_cfm:
-                cfm_eps, cfm_t = self.sample_cfm_points(len(envs_not_terminated))
+                cfm_eps, cfm_t = self.sample_cfm_points(
+                    len(envs_not_terminated), bs=envs_not_terminated
+                )
                 actions_chosen.update(
                     {
                         "cfm_eps": cfm_eps.unsqueeze(1),
@@ -224,6 +245,24 @@ class ParallelRunner:
                         .detach()
                         .unsqueeze(1),
                         "z": self.mac._last_eps[envs_not_terminated]
+                        .detach()
+                        .unsqueeze(1),
+                    }
+                )
+            if self.collect_ader_fields:
+                # flow_z: the real rollout's standard-Gaussian z (not eps=k*z)
+                # -- this is what actually produced the executed action and
+                # therefore the reward, so it's the only thing ADER's
+                # score-function estimate is allowed to use (never the 50
+                # extra cfm_eps probes, which never touched the environment).
+                # flow_k is pure diagnostics, to verify k really is frozen
+                # within one rollout batch.
+                actions_chosen.update(
+                    {
+                        "flow_z": self.mac._last_z[envs_not_terminated]
+                        .detach()
+                        .unsqueeze(1),
+                        "flow_k": self.mac._last_k[envs_not_terminated]
                         .detach()
                         .unsqueeze(1),
                     }

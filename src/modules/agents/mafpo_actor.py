@@ -26,7 +26,7 @@ class MAFPOActor(nn.Module):
 
     结构:
         obs → fc1 → ReLU → GRU → h
-        [h, x_t, t] → vel_fc1 → ReLU → vel_fc2 → velocity
+        [h, x_t, embed_t(t)] → vel_fc1 → ReLU → vel_fc2 → velocity
 
     rollout 采样（K 步 Euler，从 t=0 积分到 t=1，K = args.cfm_rollout_steps）：
         x_0 = eps ~ N(0,I)
@@ -50,8 +50,16 @@ class MAFPOActor(nn.Module):
         else:
             self.rnn = nn.Linear(hidden_dim, hidden_dim)
 
-        # 速度场 MLP: 输入 = [h, x_t, t]
-        self.vel_fc1 = nn.Linear(hidden_dim + n_actions + 1, hidden_dim)
+        # 时间嵌入维度。官方 isaaclab_fpo 的 timestep_embed_dim 默认 8，
+        # manipulation 版的 SinusoidalPosEmb 是 32——两套实现没有任何一份把 t
+        # 当裸标量喂进去。0 = 退回旧的裸标量行为（只为 A/B 对照保留）。
+        self.t_embed_dim = int(getattr(args, "fpo_timestep_embed_dim", 8))
+        assert self.t_embed_dim >= 0 and (self.t_embed_dim == 0 or self.t_embed_dim % 2 == 0), \
+            f"fpo_timestep_embed_dim 必须是 0 或正偶数，得到 {self.t_embed_dim}"
+        t_in = self.t_embed_dim if self.t_embed_dim > 0 else 1
+
+        # 速度场 MLP: 输入 = [h, x_t, embed_t(t)]
+        self.vel_fc1 = nn.Linear(hidden_dim + n_actions + t_in, hidden_dim)
         self.vel_fc2 = nn.Linear(hidden_dim, n_actions)
 
     def init_hidden(self):
@@ -71,6 +79,31 @@ class MAFPOActor(nn.Module):
 
     # ── 速度场预测 ────────────────────────────────────────────────────────────
 
+    def embed_t(self, t):
+        """Fourier 时间嵌入，等价于官方 isaaclab_fpo/modules/actor_critic.py 的
+        _embed_timestep：freqs = 2^[0 .. d/2-1]，输出 [cos(t*f), sin(t*f)]。
+
+        为什么必须要：速度场 v(h, x_t, t) 对 t 的依赖是 flow matching 的全部内
+        容。裸标量 t 只有 1 维，过一层 ReLU 之后网络基本只能表达 t 的分段线性
+        调制，K 步 Euler 积分就退化成近似"常速度场"的一次性映射，而
+        ratio = exp(L_old - L_new) 整个建在这个残差上。官方两套实现、六份任务
+        配置无一例外都用嵌入（isaaclab 8 维 Fourier，manipulation 32 维
+        SinusoidalPosEmb）。
+
+        注意 t 的约定：官方 t=1 是噪声端，我们 t=1 是动作端（见
+        fpopp_learner.py 的 x_t 构造）。这只是 t <-> 1-t 的重标定，嵌入本身
+        对两种约定同样有效，网络自己学得出来。
+
+        t: [..., 1] -> [..., t_embed_dim]
+        """
+        if self.t_embed_dim <= 0:
+            return t
+        freqs = 2.0 ** th.arange(
+            self.t_embed_dim // 2, device=t.device, dtype=t.dtype
+        )
+        scaled = t * freqs
+        return th.cat([th.cos(scaled), th.sin(scaled)], dim=-1)
+
     def velocity(self, h, x_t, t):
         """速度场: [h, x_t, t] → v。
 
@@ -85,9 +118,12 @@ class MAFPOActor(nn.Module):
         ~2e21，训练整体崩掉——回归目标一旦无界，没有这层限幅速度场权重就会被
         推向发散，这不是可选项，是无界 latent 方案的必需搭档。
         """
-        inp = th.cat([h, x_t, t], dim=-1)
+        inp = th.cat([h, x_t, self.embed_t(t)], dim=-1)
         raw = self.vel_fc2(F.relu(self.vel_fc1(inp)))
         bound = getattr(self.args, "cfm_velocity_bound", 8.0)
+        if bound <= 0:
+            # <=0 关闭限幅：速度场直接用网络原始输出（官方 isaaclab 版没有任何限幅）
+            return raw
         return bound * th.tanh(raw / bound)
 
     # ── MAC 兼容接口 ──────────────────────────────────────────────────────────

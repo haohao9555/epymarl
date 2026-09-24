@@ -9,6 +9,8 @@ from .ac_ns import ACCriticNS
 from .policyflow_critic import CentralVCritic as PolicyFlowCritic
 from .mafpo_critic import CentralVCritic as MAFPOCritic
 from .mafpo_shared_critic import SharedVCritic as MAFPOSharedCritic
+from .mafpo_gauss_critic import NormalisedCentralVCritic as MAFPOGaussCritic
+from .mafpo_gauss_q_critic import JointQCritic as MAFPOGaussQCritic
 
 
 REGISTRY = {}
@@ -24,6 +26,8 @@ REGISTRY["ac_critic_ns"] = ACCriticNS
 REGISTRY["policyflow_critic"] = PolicyFlowCritic
 REGISTRY["mafpo_critic"] = MAFPOCritic
 REGISTRY["mafpo_shared_critic"] = MAFPOSharedCritic
+REGISTRY["mafpo_gauss_critic"] = MAFPOGaussCritic
+REGISTRY["mafpo_gauss_q_critic"] = MAFPOGaussQCritic
 
 
 def register_pac_critics():

@@ -199,8 +199,11 @@ def run_sequential(args, logger):
     # fpopp_learner.py 的 docstring）fork 改进 ratio 数学而来。两者都还是
     # cfm-loss-diff 机制的调用方，共用这段 buffer 字段搭建逻辑，但
     # action_raw/action_noise/z 只有 PolicyFlow 的 MAC 会产出（见下方）。
+    # mafpo_gauss_learner（2026-09-20，flow 均值 + 显式高斯 + 精确 PPO ratio）
+    # 只要 action_raw/action_noise/z 三个 PolicyFlow 同名字段，不要任何 cfm_*
+    # 探测点字段。
     if args.learner in (
-        "policyflow_continuous_learner", "fpopp_learner",
+        "policyflow_continuous_learner", "fpopp_learner", "mafpo_gauss_learner",
     ):
         args.cfm_n_samples = getattr(args, "cfm_n_samples", 1)
         args.cfm_action_dim = getattr(args, "cfm_action_dim", args.n_actions)
@@ -223,7 +226,7 @@ def run_sequential(args, logger):
         use_pf_ratio = (
             args.learner == "policyflow_continuous_learner"
             and getattr(args, "use_policyflow_ratio", False)
-        )
+        ) or args.learner == "mafpo_gauss_learner"
         if not use_pf_ratio:
             scheme["cfm_eps"] = {
                 "vshape": (args.cfm_n_samples, args.cfm_action_dim),
@@ -242,7 +245,7 @@ def run_sequential(args, logger):
         # keep the pre-sigmoid/pre-clamp unbounded integration endpoint
         # around as _last_x1_raw, so both learners' CFM regression can
         # interpolate toward that instead of the squashed executed action.
-        if args.learner in ("policyflow_continuous_learner", "fpopp_learner"):
+        if args.learner in ("policyflow_continuous_learner", "fpopp_learner", "mafpo_gauss_learner"):
             scheme["action_raw"] = {
                 "vshape": (args.cfm_action_dim,),
                 "group": "agents",
@@ -253,7 +256,7 @@ def run_sequential(args, logger):
         # MAFPOMAC has no terminal-noise term at all, so adding these for
         # fpopp_learner would crash parallel_runner.py's collect_pf_fields
         # block (which expects all three together).
-        if args.learner == "policyflow_continuous_learner":
+        if args.learner in ("policyflow_continuous_learner", "mafpo_gauss_learner"):
             # Real injected Gaussian noise n ~ N(0,sigma^2), saved separately
             # from the clamped action -- once clamp() actually truncates a
             # sample, (action - action_raw) is no longer the true Gaussian
@@ -271,6 +274,21 @@ def run_sequential(args, logger):
             # used only for the CFM loss).
             scheme["z"] = {
                 "vshape": (args.cfm_action_dim,),
+                "group": "agents",
+            }
+        # ADER（agent-wise 自适应 base-noise scale k_i，见 mafpo_mac.py /
+        # fpopp_learner.py）：只在 fpopp_learner 且显式打开 ader_enabled 时
+        # 加这两个字段，FPO++ baseline（ader_enabled=False，默认）的 scheme
+        # 不受影响。flow_z 是真实 rollout 的标准高斯 z（不是 eps=k*z），
+        # 用来算 ADER 的 score-function 估计；flow_k 存的是同一 timestep 用
+        # 的 k，纯诊断/验证用（确认同一 batch 内 k 真的没变）。
+        if args.learner == "fpopp_learner" and getattr(args, "ader_enabled", False):
+            scheme["flow_z"] = {
+                "vshape": (args.n_actions,),
+                "group": "agents",
+            }
+            scheme["flow_k"] = {
+                "vshape": (1,),
                 "group": "agents",
             }
     #----------------------
@@ -365,7 +383,7 @@ def run_sequential(args, logger):
     recorded_mov_steps = set()
 
     is_fpo_transition_batch = args.learner in (
-        "policyflow_continuous_learner", "fpopp_learner",
+        "policyflow_continuous_learner", "fpopp_learner", "mafpo_gauss_learner",
     )
     fpo_rollout_timesteps = getattr(args, "fpo_rollout_timesteps", 2048)
     fpo_collected_timesteps = 0

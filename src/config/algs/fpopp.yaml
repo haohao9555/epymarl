@@ -99,3 +99,47 @@ wandb_run_name: "MAFPO++-individual-MPE"
 wandb_mode: "online"
 
 t_max: 20050000
+
+# --- 2026-09-05 对齐官方 FPO++（amazon-far/fpo-control）新增的键，默认值即代码里
+# 的 getattr 默认；显式写出来 sacred 才允许命令行覆盖。说明见 mafpo_mac.py 文件头
+# 与 fpopp_learner.py 的 docstring。
+fpo_action_map: "clip"         # "clip"（官方：线性映射 + 硬 clip，flow 只看未裁剪 x1）或 "sigmoid"（旧行为）
+fpo_action_clip: 2.0           # clip 模式下 x1 in [-c, c] <-> action in [0,1]（官方 clip_actions=2.0）
+fpo_action_perturb_std: 0.02   # rollout 时对 x1 的高斯扰动（官方 action_perturb_std），0 关闭
+fpo_weight_decay: 0.0001       # decay 系数（官方 weight_decay=1e-4）；<=0 退回 Adam。注意 adams 下同一数值的收缩力约是 AdamW 的 1/sqrt(v_bar) 倍（看 wandb 的 swd_v_bar_sqrt）
+fpo_optimizer: "adams"         # "adams"（Adam + Stable Weight Decay，Xie et al. 2023，components/adams.py）/ "adamw"（官方 FPO++）/ "adam"
+fpo_trust_region: "ppo"        # "ppo"（原版 FPO：所有 A 都用标准 PPO clip）/ "aspo"（官方 FPO++：A<=0 用平滑 SPO，配套 cfm_loss_clip_max_neg_adv）
+cfm_loss_huber_delta: 1.0      # CFM 回归误差的 modified Huber delta（官方 fine-tuning 版），0 = 纯 MSE
+cfm_loss_reduction: "mean"     # action 维 reduction："mean" / "sum" / "sqrt"（官方 locomotion 默认 sqrt）
+cfm_loss_clip_max_neg_adv: 3.0 # A<0 样本 new CFM loss 的单独上界（官方 cfm_loss_clamp_negative_advantages），只在 fpo_trust_region=aspo 下生效，默认等于 cfm_loss_clip_max
+fpo_lr_schedule: "fixed"       # "adaptive" = 官方 schedule="adaptive"：按新旧 x1_pred 均方差调 lr（见 fpopp_learner._adapt_lr）
+fpo_desired_kl: 0.01           # adaptive 模式的目标 KL 代理（官方 cartpole toy 配置 0.01，locomotion 1e-4）
+# 速度场的时间嵌入维度：Fourier [cos(t*2^k), sin(t*2^k)]，k=0..d/2-1，等价于官方
+# isaaclab_fpo 的 timestep_embed_dim（默认 8）。0 = 退回裸标量 t（旧行为，仅供 A/B
+# 对照）。改这个值会改变 vel_fc1 的输入维度，旧 checkpoint 载不进来。
+fpo_timestep_embed_dim: 8
+
+fpo_pfo_coef: 0.0              # PFO（Moalla et al. 2024）：L + lambda*||phi_new - phi_old||^2，phi=速度网络倒数第二层预激活；0=关闭
+
+# --- ADER：agent-wise 自适应 base-noise scale k_i（eps_i = k_i * z_i，
+# z_i~N(0,I)），score-function estimator dJ/dlog(k_i) ≈ E[A*(||z_i||^2-d)]。
+# k 只是 batch-level 的 exploration controller，不进 actor 的 Adam，不对
+# Euler integration 反向传播；在一整个 rollout batch + 该 batch 的所有
+# FPO++ epoch/minibatch 内冻结，只在 learner.train() 结束后更新一次。默认
+# 关闭，不影响现有 baseline；打开见 mafpo_mac.py / fpopp_learner.py 顶部
+# 说明。全部显式写出来，这样 sacred 才允许从命令行 `with ader_enabled=True
+# ader_mode=adaptive` 之类的方式覆盖。
+ader_enabled: False
+ader_mode: "adaptive"          # "fixed" / "adaptive"（相对排序分配，总方差守恒）/ "gradient"（log k += ader_lr * EMA(dJ/dlog k)，每个 agent 独立升降）
+ader_estimator: "pathwise"     # g 的估计方式："pathwise"（theta 固定，探测噪声 eps=s*z 走 reparam，autograd 对 log s 求 -dL_MAFPO/dlog s）/ "score"（score-function E[A*(||z||^2-d)]）
+ader_lr: 1.0                   # gradient 模式的步长；g 已按 sqrt(2d) 归一，单批 g 的量级约 1e-2，单步再受 ader_max_log_k_step 限幅
+ader_k_init: 1.0
+ader_k_values: []              # fixed 模式下可传 n_agents 个值；为空则全用 ader_k_init
+ader_warmup_updates: 10
+ader_update_interval: 1
+ader_ema_alpha: 0.05
+ader_temperature: 1.0
+ader_allocation_strength: 0.25
+ader_k_min: 0.5
+ader_k_max: 1.5
+ader_max_log_k_step: 0.05

@@ -1,0 +1,84 @@
+# --- MAFPO-Gauss：flow 均值 + 显式高斯 + 精确 PPO ratio + ADER 熵分配 ---
+# 2026-09-20 设计，见 learners/mafpo_gauss_learner.py 的 docstring：
+#   1. obs/state 运行归一化（components/obs_normalizer.py，MAC 与 critic 共用）
+#   2. mu = flow 端点，u = mu + n，n ~ N(0, sigma_i^2)，
+#      ratio 直接从 (mu, sigma) 算（同一 eps 上重新积分得 mu_new），不用 CFM/ELBO
+#   3. sigma_i 逐 agent，由 ADER 按 dJ/dlog sigma_i 在总熵守恒下分配
+
+runner: "parallel"
+mac: "mafpo_gauss_mac"
+agent: "mafpo_gauss_actor"
+learner: "mafpo_gauss_learner"
+critic_type: "mafpo_gauss_critic"
+
+batch_size_run: 8
+buffer_size: 128
+batch_size: 8
+fpo_rollout_timesteps: 2048
+
+# flow
+cfm_rollout_steps: 10          # Euler 步数（rollout 和训练里重算 mu_new 都用它）
+fpo_timestep_embed_dim: 8      # 速度场时间 Fourier 嵌入维度，0 = 裸标量
+cfm_velocity_bound: 0.0        # >0 时速度场输出 tanh 限幅；ratio 不再经过 CFM loss，默认关
+use_delta_v_ratio: False       # True：ratio 的端点位移用 mean_t[v_new - v_old]（PolicyFlow 式，梯度落在插值路径 x_t=(1-t)eps+t*mu_old 上）；False：重新积分 ODE 取精确端点
+delta_v_n_points: 8            # 插值路径上取几个 t（固定 linspace）
+flow_param: "velocity"         # "velocity"：网络直接输出 v（原版）；"endpoint"：网络输出剩余终点 g，v 被定义为 (g - x_t)/(1 - t)，Euler 递推变成 x += (g-x)/(K-k)，末步系数为 1 所以 mu = g_{K-1}
+endpoint_zero_init: True       # endpoint 模式下把输出层零初始化 -> 初始 mu 严格为 0（零力矩起步），而不是 mu ~ eps
+flow_attention: False          # True：ODE 的每一步都做一次 agent 间 self-attention（K 步积分 = K 轮协商）；注意这会让执行需要通信，不再是严格 CTDE
+flow_attention_heads: 4
+eps_rho: 0.0                  # eps 的 AR(1) 时间相关：eps_t = rho*eps_{t-1} + sqrt(1-rho^2)*xi。边际恒为 N(0,I)，ratio 不受影响。rho=0 每步独立；rho=1 整局固定；rho=0.99 约 100 步的"角色记忆"
+eps_per_episode: False        # eps_rho=1.0 的别名（每条 episode 只抽一次 eps）
+test_eps_mode: "zero"         # "zero"：test 时 eps=0（评估 mu(h,0)，flow 轨迹上的任意一点）；"sample"：eps~N(0,I)、只把终端高斯噪声置零
+mu_attention: False            # gauss_mu_source="mlp" 时，在 MLP 隐层上做一次 agent 间 self-attention：一个"会通信的高斯策略"基线（对照 CommNet/TarMAC 那一类）。噪声仍加在均值之后，attention 看不到它
+gauss_mu_source: "flow"        # "flow"：mu = Euler 积分端点；"mlp"：mu = MLP(h)，即把 flow 换成普通高斯头的消融（squashed-Gaussian MAPPO）
+
+# 高斯 / sigma
+sigma_param: "sigmoid"        # "sigmoid"：σ 有界 [sigma_min, sigma_max]（本仓库这条线）；"exp"：σ = exp(log_std) 无界，连续控制 PPO/MAPPO 的教科书参数化
+sigma_init: 0.3                # 所有 agent 同一初始 sigma（初始熵相同）
+gauss_sigma_per_dim: True      # True：sigma 形状 [n_agents, n_actions]；False：每个 agent 一个标量 sigma（MPE 这类只有移动的环境用）
+sigma_min: 0.01
+sigma_max: 1.0
+gauss_sigma_mode: "ader"       # "ader"（ADER 分配，sigma 不进 PPO loss）/ "ppo"（标准 PPO 训 sigma）/ "fixed"
+entropy_coef: 0.0              # 仅 gauss_sigma_mode=ppo 时生效
+
+# PPO
+fpo_minibatch_size: 512
+epochs: 4
+eps_clip: 0.2
+cfm_rho_clip: 3.0              # log-ratio 的 clamp（exp 之前）
+normalise_advantages: True
+lr: 0.0003
+grad_norm_clip: 10
+hidden_dim: 128
+use_rnn: True
+gae_lambda: 0.95
+standardise_returns: True
+standardise_rewards: True
+target_update_interval_or_tau: 0.01
+
+# obs 归一化
+obs_normalise: True
+obs_normalise_clip: 10.0
+
+obs_agent_id: True
+obs_last_action: False
+obs_individual_obs: False
+
+# ADER（gauss_sigma_mode=ader 时生效）
+ader_estimator: "q_pathwise"   # "q_pathwise"：额外训一个联合 Q_psi(s,a)，g = dQ/dlog sigma（reparam）/ "score"：g = E[A*((n/sigma)^2-1)]
+q_critic_type: "mafpo_gauss_q_critic"
+ader_lr: 0.02                  # ader_step_normalise=True 时是"每次更新 log sigma 最多走多少"（方向由 EMA(g)/sqrt(EMA(g^2)) 给）
+ader_step_normalise: True
+ader_ema_alpha: 0.05
+ader_warmup_updates: 10
+ader_update_interval: 1
+ader_max_log_k_step: 0.05      # 单次更新 log sigma 的步长上限
+ader_entropy_budget: True      # True：step 减去均值，总熵 sum log sigma 守恒，只做分配
+
+name: "mafpo_gauss"
+use_wandb: True
+wandb_team: "adolf9555-university-of-technology-sydney"
+wandb_project: "MAFPO-entropy"
+wandb_run_name: "MAFPO-Gauss-Hopper3x1"
+wandb_mode: "online"
+t_max: 5050000

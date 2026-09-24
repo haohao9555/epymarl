@@ -23,6 +23,13 @@ except ImportError:
     )
 
 try:
+    from .mamujoco_wrapper import MaMuJoCoWrapper  # noqa
+except ImportError:
+    warnings.warn(
+        "gymnasium-robotics/mujoco is not installed, so MaMuJoCo environments will not be available! To install, run `pip install gymnasium-robotics mujoco`"
+    )
+
+try:
     from .vmas_wrapper import VMASWrapper  # noqa
 except ImportError:
     warnings.warn(
@@ -165,7 +172,13 @@ class GymmaWrapper(MultiAgentEnv):
         # ------ 改：连续动作无可用/不可用概念，返回全 1；离散保持原逻辑 ----------
         # -----------------------------------------------------------------------------
         if self._continuous:
-            return [1] * flatdim(self._env.action_space[agent_id])
+            # Pad to the longest action space, exactly as the discrete branch
+            # below does: the buffer stores one fixed-width avail_actions row
+            # per agent, so a factorisation with unequal action dims (MaMuJoCo
+            # Humanoid "9|8") would otherwise build a ragged array. Envs whose
+            # agents all share one action dim are unaffected.
+            valid = flatdim(self._env.action_space[agent_id])
+            return [1] * valid + [0] * (flatdim(self.longest_action_space) - valid)
         # -----------------------------------------------------------------------------
         valid = flatdim(self._env.action_space[agent_id]) * [1]
         invalid = [0] * (self.longest_action_space.n - len(valid))

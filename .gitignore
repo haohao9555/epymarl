@@ -248,3 +248,12 @@ $RECYCLE.BIN/
 # End of https://www.gitignore.io/api/linux,python,windows,pycharm+all,visualstudiocode
 results/
 wandb/
+
+# --- 本地运行产物，不入库 ---
+logs/
+src/logs/
+src/results/
+reports/
+src/macflow/expert_data/
+*.pyc
+__pycache__/

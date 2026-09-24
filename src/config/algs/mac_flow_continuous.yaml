@@ -1,0 +1,98 @@
+# --- MAC-Flow (online, off-policy) for Box(0,1) continuous action spaces ---
+#
+# MADDPG's growing-replay-buffer / target-network training loop, carrying
+# MAC-Flow's three losses (arXiv:2511.05005: flow-BC + critic + Q-guided
+# distillation) instead of MADDPG's single deterministic policy-gradient
+# loss. See src/macflow/README.md for the full design writeup and
+# src/config/algs/mafpo_continuous.yaml for the (untouched) on-policy
+# PPO-ratio sibling this is deliberately NOT built on top of.
+
+runner: "parallel"
+batch_size_run: 8
+
+mac: "mac_flow_mac"
+agent: "mac_flow_one_step_actor"
+learner: "mac_flow_learner"
+critic_type: "maddpg_critic"
+
+# Growing off-policy replay buffer (MADDPG-style), NOT cleared after every
+# train() call -- contrast with mafpo_continuous.yaml's buffer_size:128 +
+# fpo_rollout_timesteps on-policy-and-discard setup.
+buffer_size: 50000
+batch_size: 32
+
+lr: 0.0003
+hidden_dim: 128
+grad_norm_clip: 10
+
+# Actor theta_* and joint-flow flow_theta_* use separate fixed references.
+# Scalar logs follow learner_log_interval; CSV keeps every train() update.
+mac_flow_theta_metrics: True
+mac_flow_theta_trace: True
+
+obs_agent_id: True
+obs_last_action: False
+obs_individual_obs: False
+
+use_rnn: True
+standardise_returns: True
+standardise_rewards: True
+
+# Soft (Polyak) target updates for target_mac / target_critic /
+# target_joint_flow, all three at the same tau -- <=1.0 means soft.
+target_update_interval_or_tau: 0.01
+
+# --- Flow / distillation specifics ---
+# Euler steps target_joint_flow integrates to produce the distillation's BC
+# anchor (Eq.9's mu_phi(o,z)). Independent from critic bootstrap, which uses
+# target_mac's one-step forward, not the flow -- see mac_flow_learner.py's
+# class docstring for why.
+mac_flow_distill_steps: 5
+# Velocity network output bound (JointFlowActor.velocity), same role and
+# same failure mode as fpo_actor.py's cfm_velocity_bound: an uncapped CFM
+# loss on buffer-shaped targets has no ceiling over long runs.
+cfm_velocity_bound: 8.0
+
+# BC-anchor weight in the distillation loss (Eq.9's alpha). Offline MAC-Flow
+# needs this large enough to suppress OOD-action exploitation of a FIXED
+# dataset's critic; here the buffer is continually refreshed by the current
+# policy, so there is no persistent OOD problem -- start closer to offline
+# strength and anneal down as training progresses (see
+# MACFlowLearner._current_bc_alpha). Set mac_flow_bc_anneal_steps: 0 to keep
+# it constant instead.
+mac_flow_bc_alpha: 1.0
+mac_flow_bc_alpha_final: 0.1
+mac_flow_bc_anneal_steps: 5000000
+
+# Small L2 penalty on the one-step actor's raw (pre-sigmoid) output, mirrors
+# maddpg_learner.py's `reg * (pis**2).mean()` stabilizer. 0 = off.
+mac_flow_actor_reg: 0.0
+
+# TD3-style clipped Gaussian smoothing added to the critic's target actions
+# (target_mac.target_actions), on top of target_mac's own intrinsic z-noise.
+# 0 = off (rely on z alone for target-action stochasticity).
+mac_flow_target_noise: 0.0
+mac_flow_target_noise_clip: 0.0
+
+# One-step actor's learned terminal-noise sigma (OneStepActor.sigma()) --
+# same sigmoid-bounded parametrization as fpo_actor.py's sigma_min/max, for
+# the same reason (unbounded parametrizations were observed there to drift
+# past the action range with no plateau over long runs).
+mac_flow_sigma_init: 0.1
+mac_flow_sigma_min: 0.01
+mac_flow_sigma_max: 1.0
+
+name: "mac_flow_continuous"
+
+use_wandb: True
+wandb_team: "adolf9555-university-of-technology-sydney"
+wandb_project: "MPE continuous algorithm"
+wandb_run_name: "MACFlow-online-MPE"
+wandb_mode: "online"
+
+record_mov: True
+record_mov_interval: 500000
+record_mov_timesteps: []
+record_mov_fps: 5
+
+t_max: 20050000

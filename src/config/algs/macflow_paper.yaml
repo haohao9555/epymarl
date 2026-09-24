@@ -1,0 +1,53 @@
+# --- MAC-Flow (arXiv:2511.05005), faithful PyTorch port --------------------
+# Ported from the official JAX code; see macflow/paper_learner.py for the
+# table of differences against this repo's earlier mac_flow_continuous line
+# (that one is a re-interpretation and is NOT this algorithm).
+#
+# Official hyper-parameters (agents/macflow.py::get_config + the paper's
+# Appendix E) are reproduced below; only the epymarl-side plumbing
+# (runner/buffer sizes) is ours.
+
+runner: "parallel"
+batch_size_run: 8
+
+mac: "macflow_paper_mac"
+agent: "macflow_paper_actor"
+learner: "macflow_paper_learner"
+
+# Off-policy replay, MADDPG-style growing buffer (the paper is offline; online
+# from scratch needs *some* data source, and a growing replay buffer is the
+# minimal change -- state this in any write-up that uses this as a baseline).
+buffer_size: 5000
+batch_size: 32
+
+# --- official defaults ---
+lr: 0.0003                      # optax.adam(3e-4), one optimiser over all nets
+macflow_alpha: 3.0              # BC distillation weight (paper's default)
+macflow_discount: 0.995
+macflow_tau: 0.005              # Polyak, critics only
+macflow_flow_steps: 10          # Euler steps for the BC flow's ODE
+macflow_seq_len: 20             # official sequence_length: one random window per sampled episode
+macflow_q_agg: "mean"           # mean(Q1,Q2), NOT min -- avoids offline pessimism
+macflow_normalize_q_loss: True  # lambda = 1/|Q_tot| on the value term
+macflow_layer_norm: True        # critics (called crucial for stability)
+macflow_actor_layer_norm: False # actors
+macflow_actor_hidden_dims: [512, 512, 512, 512]
+macflow_value_hidden_dims: [512, 512, 512, 512]
+macflow_eval_zero_z: False      # evaluate with a fresh z, like training
+
+grad_norm_clip: 10
+use_rnn: False                  # official implementation is feed-forward
+obs_agent_id: True
+obs_last_action: False
+obs_individual_obs: False
+standardise_returns: False
+standardise_rewards: True
+
+name: "macflow_paper"
+use_wandb: True
+wandb_team: "adolf9555-university-of-technology-sydney"
+wandb_project: "MAFPO-entropy"
+wandb_run_name: "MACFlow-paper-pytorch"
+wandb_mode: "online"
+record_mov: False
+t_max: 10050000
