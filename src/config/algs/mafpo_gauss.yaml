@@ -24,8 +24,14 @@ use_delta_v_ratio: False       # True：ratio 的端点位移用 mean_t[v_new - 
 delta_v_n_points: 8            # 插值路径上取几个 t（固定 linspace）
 flow_param: "velocity"         # "velocity"：网络直接输出 v（原版）；"endpoint"：网络输出剩余终点 g，v 被定义为 (g - x_t)/(1 - t)，Euler 递推变成 x += (g-x)/(K-k)，末步系数为 1 所以 mu = g_{K-1}
 endpoint_zero_init: True       # endpoint 模式下把输出层零初始化 -> 初始 mu 严格为 0（零力矩起步），而不是 mu ~ eps
+endpoint_init_scale: 1.0       # endpoint_zero_init=False 时输出层 = 默认初始化 × s。0.01：mu≈0 起步但所有层第一步就有梯度（全 0 时 vel_fc1/attention 梯度恒为 0）
+attn_out_init_scale: 0.0       # attention out_proj = 默认初始化 × s；0 = 零初始化（旧行为，Q/K/V 起步无梯度），0.01 = 小权重起步
 flow_attention: False          # True：ODE 的每一步都做一次 agent 间 self-attention（K 步积分 = K 轮协商）；注意这会让执行需要通信，不再是严格 CTDE
 flow_attention_heads: 4
+attn_layernorm: False          # True：attention 分支 pre-LN，z + Attn(LN(z))。实测 z 只有 0.3~0.5，LN 反而把 Q/K/V（含 V）放大 2~3.6 倍、attention 接管 mu，不推荐，用 attn_qk_norm
+attn_qk_norm: False            # True：只对 Q、K 逐头做 LayerNorm，V 用原始 z。实测（run 14）与 LN 同一病：Q/K 被放大、注意力翻转太快，不推荐
+attn_gate_init: 0.0            # >0：z + a*m，a 逐通道可学、初值为此（LayerScale 式），attention 慢慢进入策略；m 不归一化。0 = 原样 z + m
+attn_lr_scale: 1.0             # attention 参数（Q/K/V、out_proj、gate）的学习率 = lr * s；<1 让 attention 学得比策略主体慢
 eps_rho: 0.0                  # eps 的 AR(1) 时间相关：eps_t = rho*eps_{t-1} + sqrt(1-rho^2)*xi。边际恒为 N(0,I)，ratio 不受影响。rho=0 每步独立；rho=1 整局固定；rho=0.99 约 100 步的"角色记忆"
 eps_per_episode: False        # eps_rho=1.0 的别名（每条 episode 只抽一次 eps）
 test_eps_mode: "zero"         # "zero"：test 时 eps=0（评估 mu(h,0)，flow 轨迹上的任意一点）；"sample"：eps~N(0,I)、只把终端高斯噪声置零

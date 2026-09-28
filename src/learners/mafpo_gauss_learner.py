@@ -1,5 +1,6 @@
 import copy
 import math
+import os
 
 import torch as th
 from torch.optim import Adam
@@ -72,7 +73,19 @@ class MAFPOGaussLearner:
         sigma_params = [mac.agent.raw_sigma]
         other_params = [p for p in mac.parameters() if p is not mac.agent.raw_sigma]
         self.actor_params = other_params + (sigma_params if self.sigma_mode == "ppo" else [])
-        self.actor_optimiser = Adam(params=self.actor_params, lr=args.lr)
+        # attn_lr_scale: the attention parameters (Q/K/V, out_proj, gate) learn at
+        # lr * s, so the attention enters the policy more slowly than the rest.
+        attn_lr_scale = float(getattr(args, "attn_lr_scale", 1.0))
+        if attn_lr_scale != 1.0:
+            attn_ids = {id(p) for n, p in mac.agent.named_parameters()
+                        if n.startswith(("attn", "mu_attn"))}
+            self.actor_optimiser = Adam([
+                {"params": [p for p in self.actor_params if id(p) not in attn_ids]},
+                {"params": [p for p in self.actor_params if id(p) in attn_ids],
+                 "lr": args.lr * attn_lr_scale},
+            ], lr=args.lr)
+        else:
+            self.actor_optimiser = Adam(params=self.actor_params, lr=args.lr)
 
         self.critic = critic_registry[args.critic_type](scheme, args)
         self.critic.normalizer = mac.obs_normalizer
@@ -293,6 +306,13 @@ class MAFPOGaussLearner:
                         ((valid_a < 0.02) | (valid_a > 0.98)).float().mean().item(), t_env,
                     )
                 self.logger.log_stat("mu_abs_max", mu_old_all.abs().max().item(), t_env)
+                agent = self.mac.agent
+                if getattr(agent, "attn_share", None) is not None:
+                    self.logger.log_stat("attn_share", agent.attn_share.item(), t_env)
+                for gname in ("attn_gate", "mu_attn_gate"):
+                    gate = getattr(agent, gname, None)
+                    if gate is not None:
+                        self.logger.log_stat(f"{gname}_mean", gate.abs().mean().item(), t_env)
                 sigma = self.mac.agent.sigma()
                 ent = self.mac.agent.entropy_per_agent()
                 self.logger.log_stat("sigma_mean", sigma.mean().item(), t_env)
@@ -482,6 +502,37 @@ class MAFPOGaussLearner:
         th.save(self.critic_optimiser.state_dict(), "{}/critic_opt.th".format(path))
         if self.q_critic is not None:
             th.save(self.q_critic.state_dict(), "{}/q_critic.th".format(path))
+        # The reward/return running normalisers are part of the training state:
+        # advantages are divided by ret_ms.var and rewards by rew_ms.var, so a
+        # resume that leaves them at their init (mean 0, var 1, count 1e-4)
+        # rescales every advantage for the first few updates. Keep them with the
+        # checkpoint so a continued run picks up where it left off.
+        norm = {}
+        if self.args.standardise_rewards:
+            norm["rew_ms"] = dict(mean=self.rew_ms.mean, var=self.rew_ms.var, count=self.rew_ms.count)
+        if self.args.standardise_returns:
+            norm["ret_ms"] = dict(mean=self.ret_ms.mean, var=self.ret_ms.var, count=self.ret_ms.count)
+        if norm:
+            th.save(norm, "{}/reward_norm.th".format(path))
+
+    def _load_norm(self, path):
+        """Restore rew_ms/ret_ms. Checkpoints written before this was added have
+        no such file -- say so loudly rather than silently resuming with the
+        statistics reset, because that shows up as a transient in the advantage
+        scale right after the resume."""
+        f = "{}/reward_norm.th".format(path)
+        if not os.path.exists(f):
+            self.logger.console_logger.warning(
+                "checkpoint has no reward_norm.th: rew_ms/ret_ms restart from "
+                "their init, expect an advantage-scale transient after resume")
+            return
+        norm = th.load(f, map_location=lambda s_, l: s_)
+        for name, ms in (("rew_ms", getattr(self, "rew_ms", None)),
+                         ("ret_ms", getattr(self, "ret_ms", None))):
+            if name in norm and ms is not None:
+                ms.mean = norm[name]["mean"].to(ms.mean.device)
+                ms.var = norm[name]["var"].to(ms.var.device)
+                ms.count = norm[name]["count"]
 
     def load_models(self, path):
         self.mac.load_models(path)
@@ -489,3 +540,4 @@ class MAFPOGaussLearner:
         self.target_critic.load_state_dict(self.critic.state_dict())
         self.actor_optimiser.load_state_dict(th.load("{}/actor_opt.th".format(path), map_location=lambda s, l: s))
         self.critic_optimiser.load_state_dict(th.load("{}/critic_opt.th".format(path), map_location=lambda s, l: s))
+        self._load_norm(path)

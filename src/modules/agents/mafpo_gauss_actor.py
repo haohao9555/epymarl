@@ -80,6 +80,18 @@ class MAFPOGaussActor(nn.Module):
             if self.flow_param == "endpoint" and bool(getattr(args, "endpoint_zero_init", True)):
                 nn.init.zeros_(self.vel_fc2.weight)
                 nn.init.zeros_(self.vel_fc2.bias)
+            elif self.flow_param == "endpoint":
+                # endpoint_init_scale: PyTorch's default init scaled by s (1 = as
+                # is). A small s (0.01, the usual PPO policy-head choice) starts
+                # mu ~ 0 like the zero init, but vel_fc1 and the attention get a
+                # non-zero gradient from the first update -- tiny, yet Adam
+                # normalises it, so they learn at full speed. Exact zero gives
+                # them exactly nothing until vel_fc2 has moved.
+                s = float(getattr(args, "endpoint_init_scale", 1.0))
+                if s != 1.0:
+                    with th.no_grad():
+                        self.vel_fc2.weight.mul_(s)
+                        self.vel_fc2.bias.mul_(s)
             # Inter-agent attention INSIDE the ODE: every Euler step is one round
             # of negotiation. Each agent turns (h_i, x_k^i, t) into a token,
             # attends over the other agents' tokens -- i.e. over where everyone
@@ -92,15 +104,17 @@ class MAFPOGaussActor(nn.Module):
             # other agents' current x_k), so it is a communicating-agents method,
             # not strict CTDE. The channel is small: A floats per agent per round.
             #
-            # out_proj is zero-initialised so the attention contributes nothing at
+            # out_proj is zero-initialised (attn_out_init_scale=0, the default) so the attention contributes nothing at
             # init -- the run starts exactly as the attention-free version and
             # grows coupling only if it pays off.
             self.flow_attention = bool(getattr(args, "flow_attention", False))
             if self.flow_attention:
                 heads = int(getattr(args, "flow_attention_heads", 4))
                 self.attn = nn.MultiheadAttention(hidden_dim, heads, batch_first=True)
-                nn.init.zeros_(self.attn.out_proj.weight)
-                nn.init.zeros_(self.attn.out_proj.bias)
+                self._init_attn_out(self.attn)
+                self.attn_norm = self._make_attn_norm(hidden_dim)
+                self.attn_qk_norm = self._make_qk_norm(hidden_dim // heads)
+                self.attn_gate = self._make_attn_gate(hidden_dim)
         else:
             self.mu_fc1 = nn.Linear(hidden_dim, hidden_dim)
             self.mu_fc2 = nn.Linear(hidden_dim, n_actions)
@@ -113,15 +127,17 @@ class MAFPOGaussActor(nn.Module):
             # mean, where attention cannot see it, so two agents with identical
             # observations still get identical means.
             #
-            # out_proj is zero-initialised, so at init this is exactly the MLP
+            # out_proj is zero-initialised by default, so at init this is exactly the MLP
             # baseline. Unlike the flow head's attention it gets a non-zero
             # gradient from step one, because mu_fc2 is not zero-initialised.
             self.mu_attention = bool(getattr(args, "mu_attention", False))
             if self.mu_attention:
                 heads = int(getattr(args, "flow_attention_heads", 4))
                 self.mu_attn = nn.MultiheadAttention(hidden_dim, heads, batch_first=True)
-                nn.init.zeros_(self.mu_attn.out_proj.weight)
-                nn.init.zeros_(self.mu_attn.out_proj.bias)
+                self._init_attn_out(self.mu_attn)
+                self.mu_attn_norm = self._make_attn_norm(hidden_dim)
+                self.mu_attn_qk_norm = self._make_qk_norm(hidden_dim // heads)
+                self.mu_attn_gate = self._make_attn_gate(hidden_dim)
 
         # sigma_param:
         #   "sigmoid" (default, this repo's line) -- sigma is bounded to
@@ -149,6 +165,91 @@ class MAFPOGaussActor(nn.Module):
         self.sigma_per_dim = bool(getattr(args, "gauss_sigma_per_dim", True))
         sigma_shape = (n_agents, n_actions) if self.sigma_per_dim else (n_agents, 1)
         self.raw_sigma = nn.Parameter(th.full(sigma_shape, raw_init))
+
+    def _init_attn_out(self, mha):
+        """attn_out_init_scale: 0 (default) zero-initialises out_proj, so the run
+        starts exactly as the attention-free one -- but then Q/K/V get no
+        gradient at all until out_proj has moved. s > 0 keeps PyTorch's default
+        out_proj weights scaled by s: the attention is still negligible at init,
+        yet all of it learns from the first update. Scaling draws no random
+        numbers, so the RNG stream is the same for every s."""
+        s = float(getattr(self.args, "attn_out_init_scale", 0.0))
+        with th.no_grad():
+            if s == 0.0:
+                mha.out_proj.weight.zero_()
+            else:
+                mha.out_proj.weight.mul_(s)
+            mha.out_proj.bias.zero_()
+
+    def _make_attn_norm(self, hidden_dim):
+        """attn_layernorm: pre-LN on the attention branch only, z + Attn(LN(z)).
+        The tokens are z = ReLU(W1 [h, x, t]) >= 0 with no scale control, so the
+        q.k logits grow with |z| and the softmax can saturate (15-22% of rows
+        were already near one-hot at 7.5M on HalfCheetah-6x1). LN fixes the
+        scale of what Q/K/V see; the residual z (the agent's own path into W2)
+        is untouched, and with out_proj zero-initialised the model still starts
+        exactly as the attention-free one. LayerNorm's init draws no random
+        numbers, so a run with the flag on starts bit-identical to one without.
+        Off -> Identity: no new parameters, old checkpoints still load.
+
+        Measured afterwards (HalfCheetah-6x1, 2026-09-26): the premise was wrong.
+        z never grew (RMS 0.44-0.56 without LN), so LN AMPLIFIED what Q/K/V see
+        by 2-3.6x, V included. With Adam's fixed parameter step that is a 2-3.6x
+        faster attention branch: it took over mu (W2 m RMS 3-4 vs W2 z 0.3-0.5),
+        pushed 43% of mu past saturation and learned far slower. Use
+        attn_qk_norm instead, which bounds the logits without touching V."""
+        if bool(getattr(self.args, "attn_layernorm", False)):
+            return nn.LayerNorm(hidden_dim)
+        return nn.Identity()
+
+    def _make_qk_norm(self, head_dim):
+        """attn_qk_norm: LayerNorm on Q and K per head (over head_dim), V left on
+        the raw tokens. With gamma = 1 every q, k has norm sqrt(head_dim), so a
+        logit q.k/sqrt(head_dim) is bounded by sqrt(head_dim) (5.7 at 4 heads x 32)
+        whatever the token scale, while the attention OUTPUT keeps the scale of
+        V = W_V z -- the part LN on the whole token inflated. The parameters of
+        nn.MultiheadAttention are reused (same init, same state_dict keys) and
+        LayerNorm draws no random numbers, so a run with the flag on starts
+        bit-identical to one without. Off -> None: the stock module is called."""
+        if bool(getattr(self.args, "attn_qk_norm", False)):
+            return nn.ModuleList([nn.LayerNorm(head_dim), nn.LayerNorm(head_dim)])
+        return None
+
+    def _make_attn_gate(self, hidden_dim):
+        """attn_gate_init > 0: LayerScale-style gate, z + a * m with a learnable
+        per-channel a started at attn_gate_init, so the attention enters the
+        policy slowly -- at ~a of its natural weight -- and only grows while the
+        policy gradient keeps asking for it. m is NOT normalised: dividing a
+        small vector by its own scale is what made LN / QK-norm learn too fast
+        (HalfCheetah-6x1 runs 13/14). 0 (default) -> None: plain z + m."""
+        a0 = float(getattr(self.args, "attn_gate_init", 0.0))
+        if a0 > 0:
+            return nn.Parameter(th.full((hidden_dim,), a0))
+        return None
+
+    def _gated_residual(self, z, m, gate):
+        """z + gate * m; also keeps rms(gate*m)/rms(z) of the latest call (the
+        last Euler round) as attn_share, for the learner to log."""
+        if gate is not None:
+            m = gate * m
+        with th.no_grad():
+            self.attn_share = m.pow(2).mean().sqrt() / z.pow(2).mean().sqrt().clamp_min(1e-12)
+        return z + m
+
+    @staticmethod
+    def _attend(mha, z, qk_norm):
+        """Self-attention over the agent axis of z [M, N, H] (no residual)."""
+        if qk_norm is None:
+            return mha(z, z, z, need_weights=False)[0]
+        M, N, H = z.shape
+        nh = mha.num_heads
+        d = H // nh
+        q, k, v = F.linear(z, mha.in_proj_weight, mha.in_proj_bias).chunk(3, dim=-1)
+        q, k, v = (a.reshape(M, N, nh, d).transpose(1, 2) for a in (q, k, v))  # [M,nh,N,d]
+        q, k = qk_norm[0](q), qk_norm[1](k)
+        w = th.softmax(q @ k.transpose(-2, -1) / math.sqrt(d), dim=-1)          # [M,nh,N,N]
+        out = (w @ v).transpose(1, 2).reshape(M, N, H)
+        return mha.out_proj(out)
 
     # ── sigma ────────────────────────────────────────────────────────────────
 
@@ -226,7 +327,8 @@ class MAFPOGaussActor(nn.Module):
             assert N == self.args.n_agents, (
                 f"flow_attention needs the agent axis at dim -2, got {z.shape}")
             zf = z.reshape(-1, N, H)
-            zf = zf + self.attn(zf, zf, zf, need_weights=False)[0]  # residual
+            za = self.attn_norm(zf)
+            zf = self._gated_residual(zf, self._attend(self.attn, za, self.attn_qk_norm), self.attn_gate)
             z = zf.reshape(*lead, N, H)
         raw = self.vel_fc2(z)
         bound = float(getattr(self.args, "cfm_velocity_bound", 0.0))
@@ -267,7 +369,8 @@ class MAFPOGaussActor(nn.Module):
                 assert N == self.args.n_agents, (
                     f"mu_attention needs the agent axis at dim -2, got {z.shape}")
                 zf = z.reshape(-1, N, H)
-                zf = zf + self.mu_attn(zf, zf, zf, need_weights=False)[0]
+                za = self.mu_attn_norm(zf)
+                zf = self._gated_residual(zf, self._attend(self.mu_attn, za, self.mu_attn_qk_norm), self.mu_attn_gate)
                 z = zf.reshape(*lead, N, H)
             return self.mu_fc2(z)
         n_steps = getattr(self.args, "cfm_rollout_steps", 10)

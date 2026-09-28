@@ -57,7 +57,16 @@ class ObsNormalizer:
         }
 
     def load_state_dict(self, sd):
-        self.obs_ms.mean, self.obs_ms.var, self.obs_ms.count = sd["obs_mean"], sd["obs_var"], sd["obs_count"]
-        self.state_ms.mean, self.state_ms.var, self.state_ms.count = (
-            sd["state_mean"], sd["state_var"], sd["state_count"]
-        )
+        # Assign onto the device the normaliser already lives on. The checkpoint
+        # is loaded with map_location=storage (i.e. CPU), so assigning the loaded
+        # tensors straight in would silently move the running statistics to CPU
+        # while the rest of the model stays on the GPU -- the next update() then
+        # dies with "found at least two devices". Only shows up when resuming.
+        def _to(dst, src):
+            return src.to(dst.device) if hasattr(src, "to") else src
+        self.obs_ms.mean = _to(self.obs_ms.mean, sd["obs_mean"])
+        self.obs_ms.var = _to(self.obs_ms.var, sd["obs_var"])
+        self.obs_ms.count = sd["obs_count"]
+        self.state_ms.mean = _to(self.state_ms.mean, sd["state_mean"])
+        self.state_ms.var = _to(self.state_ms.var, sd["state_var"])
+        self.state_ms.count = sd["state_count"]

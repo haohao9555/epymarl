@@ -5,7 +5,7 @@
 # this repo sums the common reward.
 cd /root/.cache/conda/epymarl-main
 echo "=== $(TZ=Australia/Sydney date '+%m-%d %H:%M') Sydney ==="
-echo "--- queue ---"; for q in logs/queue_baselines.log logs/queue_next3.log; do [ -f "$q" ] && { echo "  [$q]"; tail -4 "$q"; }; done
+echo "--- queue ---"; for q in logs/queue_ant_20M.log logs/queue_front_disp.log; do [ -f "$q" ] && { echo "  [$q]"; tail -4 "$q"; }; done
 echo "--- running ---"
 ps -eo sid,pid,etime,args --no-headers | awk '$1==$2' | grep "[s]rc/main.py" | while read -r sid pid et rest; do
   key=$(echo "$rest" | grep -o "key=[^ ]*"); nm=$(echo "$rest" | grep -oP "(?<= )name=\S+")
@@ -20,7 +20,14 @@ want = ["mappo_textbook_hc6x1_10M",     "mappo_textbook_hopper_10M",
         "mappo_textbook_swim10x2_10M",
         "mafpo_v0_attn_ppoSigma_hc6x1_10M", "mafpo_v0_attn_ppoSigma_hopper_10M",
         "mafpo_v0_attn_ppoSigma_humanoid_10M",
-        "mafpo_v0_fixed_hc6x1_10M", "mafpo_v0_fixed_hopper_10M",
+        "mafpo_v0_fixed_hc6x1_10M", "mafpo_v0_noattn_hc6x1_10M",
+        "mafpo_v0_attnLN_hc6x1_10M", "mafpo_v0_attnQK_small_epsStep_hc6x1_10M",
+        "mafpo_v0_attnGate_epsStep_hc6x1_10M",
+        "mappo_ant4x2_lr1e3_10M", "mafpo_noattn_ant4x2_lr1e3_10M",
+        "commflow_gate_ant4x2_lr1e3_10M", "commflow_LN_ant4x2_lr1e3_10M",
+        "commflow_gate_ant4x2_lr3e4_10M", "commflow_gate_ant4x2_lr1e3_20M", "mappo_ant4x2_lr1e3_20M",
+        "commflow_gate_ant4x2_lr1e3_15M_s42", "mappo_ant4x2_lr1e3_15M_s42",
+        "mafpo_v0_fixed_hopper_10M",
         "mafpo_v0_fixed_humanoid_10M", "mafpo_v0_fixed_ant4x2_10M",
         "mafpo_v0_fixed_swim10x2_10M"]
 N = {"hc6x1": 6, "hopper": 3, "humanoid": 2, "ant4x2": 4, "swim10x2": 10}

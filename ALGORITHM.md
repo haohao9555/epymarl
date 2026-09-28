@@ -140,9 +140,15 @@ theta 未更新时 ratio 严格 = 1（实测 log_ratio = 0.000000）。
 | `gauss_mu_source` | `flow` | flow / **mlp** | mlp = MAPPO，共用同一份 learner |
 | `flow_param` | `velocity` | **endpoint** | endpoint：网络输出终点 g；velocity：输出速度 v |
 | `endpoint_zero_init` | `True` | **False** | 见 §6.1，True 会把 vel_fc1 和 attention 的梯度打成精确 0 |
+| `endpoint_init_scale` | 1.0 | 试验中 0.01 | `endpoint_zero_init=False` 时输出层 = 默认初始化 × s。小 s：mu≈0 起步，且 vel_fc1/attention 第一步就有梯度（Adam 归一化后正常速度学） |
+| `attn_out_init_scale` | 0.0 | 试验中 0.01 | attention `out_proj` = 默认初始化 × s；0 即零初始化（Q/K/V 要等 out_proj 离开 0 才有梯度） |
 | `cfm_rollout_steps` (K) | 10 | **5** | 见 §3.2，K 几乎不影响表达能力 |
 | `flow_attention` | `False` | **True** | ODE 每步一轮 agent 间 self-attention；执行需要通信，非严格 CTDE |
 | `flow_attention_heads` | 4 | 4 | |
+| `attn_layernorm` | `False` | **不推荐** | attention 分支 pre-LN：`z + Attn(LN(z))`。前提（z 会长大）不成立：实测 z 的 RMS 只有 0.3~0.5，LN 把 Q/K/V 放大 2~3.6 倍，attention 接管 mu（W2·m RMS 3~4 vs W2·z 0.3~0.5），43% 的 mu 饱和，run 13 学得远比 run 10 慢 |
+| `attn_qk_norm` | `False` | **不推荐** | 只对 Q、K 逐头做 LayerNorm，V 仍用原始 z。run 14（1.52M 叫停）与 LN 同一 signature：KL×5、clip×4、mu_abs_max 1M 就到 10。q 的尺度仅 ~0.28，归一化放大 Adam 有效步长，注意力模式翻转太快 |
+| `attn_gate_init` | 0.0 | 试验中 | >0：`z + a⊙m`，a 逐通道可学、初值小（LayerScale 式），attention 慢慢进入策略。m 不归一化。日志 `attn_share` = rms(a⊙m)/rms(z)（末轮）、`attn_gate_mean` |
+| `attn_lr_scale` | 1.0 | 试验中 | attention 参数单独的学习率倍率（Adam 参数组），<1 让 attention 学得比策略主体慢 |
 | `eps_rho` | `0.0` | 见 §6.2 | eps 的 AR(1) 时间相关。0=每步独立，1=整局固定 |
 | `eps_per_episode` | `False` | — | `eps_rho=1.0` 的别名 |
 | `test_eps_mode` | `"zero"` | **sample** | zero：test 时 eps=0（评估 x_1(h,0)，轨迹上的任意一点）；sample：eps~N(0,I) 抽一次、n=0 |

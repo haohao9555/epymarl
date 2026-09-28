@@ -1,0 +1,21 @@
+# VMAS（Vectorized Multi-Agent Simulator，Bettini et al. 2022），经 envs/vmas_wrapper.py 走 gymma。
+# key 形如 vmas-<scenario>。不放 MPE 专用的 N：VMAS 场景会拒绝未知 kwarg。
+# 默认是 dispersion：N 个 agent 都从原点出发、观测完全相同，要分头吃 N 个食物。
+# 该任务要求在参数共享下打破对称，所以跑时应配 obs_agent_id=False。
+env: "gymma"
+
+env_args:
+  key: "vmas-dispersion"
+  time_limit: 40          # 完美分工约 26 步吃完 4 个；抱团依次吃在 40 步内平均只吃到 2.35 个（100 步时 3.8 个，与分工分不开）
+  pretrained_wrapper: null
+  continuous_actions: True
+  n_agents: 4
+  share_reward: True
+
+test_greedy: True
+test_nepisode: 32
+test_interval: 50000
+log_interval: 50000
+runner_log_interval: 10000
+learner_log_interval: 10000
+t_max: 3050000
