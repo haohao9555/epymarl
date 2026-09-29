@@ -52,6 +52,10 @@ class MAFPOGaussMAC:
         # and keeps only the terminal Gaussian noise at zero.
         self.test_eps_mode = str(getattr(args, "test_eps_mode", "zero")).lower()
         assert self.test_eps_mode in ("zero", "sample"), self.test_eps_mode
+        # test_sample_noise：test 时也抽终端噪声 n（评估随机策略本身）。默认 False =
+        # test 时 n=0；在"观测全相同"的对称任务上那会让 MAPPO 类所有 agent 动作完全相同，
+        # 评估对它们不公平。
+        self.test_sample_noise = bool(getattr(args, "test_sample_noise", False))
         device = "cuda" if args.use_cuda else "cpu"
         self.obs_normalizer = ObsNormalizer(scheme, args, device)
         input_shape = self._get_input_shape(scheme)
@@ -83,7 +87,8 @@ class MAFPOGaussMAC:
                 h.view(B, self.n_agents, -1), eps.view(B, self.n_agents, n_act)
             ).view(B, self.n_agents, n_act)
             sigma = self.agent.sigma().unsqueeze(0).expand(B, -1, -1)      # [B,N,A]
-            noise = th.zeros_like(mu) if test_mode else th.randn_like(mu) * sigma
+            zero_noise = test_mode and not self.test_sample_noise
+            noise = th.zeros_like(mu) if zero_noise else th.randn_like(mu) * sigma
             action = th.sigmoid(mu + noise)
 
         self._last_x1_raw = mu
@@ -124,10 +129,16 @@ class MAFPOGaussMAC:
             th.load("{}/obs_norm.th".format(path), map_location=lambda storage, loc: storage)
         )
 
+    @property
+    def _last_action_input(self):
+        # actor_last_action：只给 actor（GRU 输入）接上一步动作；mafpo_gauss_critic
+        # 不接受 obs_last_action，所以 critic 的输入保持不变。
+        return bool(self.args.obs_last_action or getattr(self.args, "actor_last_action", False))
+
     def _build_inputs(self, batch, t):
         bs = batch.batch_size
         inputs = [self.obs_normalizer.normalize_obs(batch["obs"][:, t])]
-        if self.args.obs_last_action:
+        if self._last_action_input:
             if t == 0:
                 inputs.append(th.zeros_like(batch["actions"][:, t]))
             else:
@@ -144,7 +155,7 @@ class MAFPOGaussMAC:
         bs = batch.batch_size
         T = batch.max_seq_length - 1
         inputs = [self.obs_normalizer.normalize_obs(batch["obs"][:, :T])]          # [B,T,N,O]
-        if self.args.obs_last_action:
+        if self._last_action_input:
             prev = th.cat([th.zeros_like(batch["actions"][:, :1]), batch["actions"][:, :T - 1]], dim=1)
             inputs.append(prev)
         if self.args.obs_agent_id:
@@ -156,7 +167,7 @@ class MAFPOGaussMAC:
 
     def _get_input_shape(self, scheme):
         input_shape = scheme["obs"]["vshape"]
-        if self.args.obs_last_action:
+        if self._last_action_input:
             input_shape += scheme["actions"]["vshape"][0]
         if self.args.obs_agent_id:
             input_shape += self.n_agents

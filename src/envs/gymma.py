@@ -29,6 +29,7 @@ except ImportError:
         "gymnasium-robotics/mujoco is not installed, so MaMuJoCo environments will not be available! To install, run `pip install gymnasium-robotics mujoco`"
     )
 
+from .lever_env import LeverEnv  # noqa  (registers gym id "lever"; numpy/gymnasium only)
 try:
     from .vmas_wrapper import VMASWrapper  # noqa
 except ImportError:

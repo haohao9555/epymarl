@@ -1,0 +1,21 @@
+# 连续版 lever pulling（CommNet 的杠杆任务），见 envs/lever_env.py。
+# 所有 agent 观测相同、没有身份：只能靠"协调过的随机性"分工。
+# 独立策略（MAPPO / MAPPO+attn / MAFPO）的上限 1-(1-1/m)^m（m=5 约 0.67），CommFlow 可到 1。
+# 跑的时候配 obs_agent_id=False；模型很小，建议 use_cuda=False 放 CPU 跑。
+env: "gymma"
+
+env_args:
+  key: "lever"
+  time_limit: 2           # 必须 > steps：episode 靠 terminated 结束，不能被 TimeLimit 截断
+  pretrained_wrapper: null
+  n_agents: 5
+  n_levers: 5
+  steps: 1
+
+test_greedy: True
+test_nepisode: 512
+test_interval: 20000
+log_interval: 20000
+runner_log_interval: 5000
+learner_log_interval: 5000
+t_max: 300000

@@ -93,6 +93,22 @@ class MAFPOGaussLearner:
         self.target_critic.normalizer = mac.obs_normalizer
         self.critic_params = list(self.critic.parameters())
         self.critic_optimiser = Adam(params=self.critic_params, lr=args.lr)
+        # gae_value：GAE / lambda-return 用哪个 V。
+        #   "target"（默认，原行为）：软更新的 target critic，每次 train() 按 tau 追一次，
+        #       MuJoCo 上 1000 步一局、8 局训一次，tau=0.01 约等于落后 ~0.8M env 步；
+        #       每个 epoch 用它重算一遍 advantage（target 在 train() 内不变）。
+        #   "online"（官方 MAPPO 做法）：train() 开始时用当前 critic 算一次 V，
+        #       advantage / target_returns 整个 train() 内固定，critic 每个 epoch 回归它。
+        # flow_cons：约束 ODE 各轮终点猜测 g_k 的一致性（只对 flow + endpoint），防止各轮
+        # 放大倍数 c = dg/dx 连乘导致 mu 指数爆炸。训练层面的正则，前向不变，默认关闭。
+        #   "step"  ：保险丝，相邻两轮只能差 margin 以内：mean_k max(0, |g_{k+1}-g_k| - margin)^2
+        #   "anchor"：各轮向最终 mu 看齐：mean_{k<K-1} (g_k - sg(mu))^2
+        self.flow_cons_mode = str(getattr(args, "flow_cons_mode", "none")).lower()
+        assert self.flow_cons_mode in ("none", "step", "anchor"), self.flow_cons_mode
+        self.flow_cons_coef = float(getattr(args, "flow_cons_coef", 0.0))
+        self.flow_cons_margin = float(getattr(args, "flow_cons_margin", 1.0))
+        self.gae_value = str(getattr(args, "gae_value", "target")).lower()
+        assert self.gae_value in ("target", "online"), self.gae_value
 
         # 只服务 sigma 的联合 Q_psi(s,a)，见类 docstring 第 4 条。
         self.ader_estimator = str(getattr(args, "ader_estimator", "q_pathwise")).lower()
@@ -184,17 +200,27 @@ class MAFPOGaussLearner:
 
         actor_stats = {k: [] for k in [
             "pg_loss", "ppo_clip_fraction", "actor_grad_norm", "ratio_mean", "approx_kl",
-            "mu_shift_abs_mean", "entropy_total",
+            "mu_shift_abs_mean", "entropy_total", "flow_cons_loss", "flow_step_viol",
         ]}
         critic_train_stats = {k: [] for k in [
             "critic_loss", "critic_grad_norm", "td_error_abs", "target_mean", "value_mean",
-            "q_loss", "q_mean",
+            "q_loss", "q_mean", "critic_target_gap",
         ]}
+
+        # 诊断：当前 critic 和 target critic 在这批数据上差多远（标准化回报单位，masked
+        # 均值），直接量 target 的滞后。只是前向，不改变任何训练量。
+        with th.no_grad():
+            gap = (self.critic(batch)[:, :-1] - self.target_critic(batch)[:, :-1]).squeeze(3).abs()
+            critic_train_stats["critic_target_gap"].append(
+                ((gap * critic_mask).sum() / critic_mask.sum()).item())
+        online_targets = None
+        if self.gae_value == "online":
+            online_targets = self._gae_targets(self.critic, batch, rewards, critic_mask)
 
         first_advantages = None
         for _ in range(self.args.epochs):
             advantages, target_returns, epoch_critic_stats = self.train_critic_sequential(
-                self.critic, self.target_critic, batch, rewards, critic_mask
+                self.critic, self.target_critic, batch, rewards, critic_mask, targets=online_targets
             )
             advantages = advantages.detach()                     # [B,T,N]
             for key, values in epoch_critic_stats.items():
@@ -219,6 +245,7 @@ class MAFPOGaussLearner:
                 mb = permutation[start:start + minibatch_size]
                 h_seq = self._build_actor_hidden_sequence(batch)          # [B,T,N,H]
                 h_mb = h_seq.reshape(-1, self.n_agents, h_seq.shape[-1])[mb]   # [M,N,H]
+                guesses = None                                            # flow_cons 用的各轮 g_k
 
                 sigma_new = self.mac.agent.sigma()                        # [N,A]
                 if self.sigma_mode != "ppo":
@@ -234,7 +261,10 @@ class MAFPOGaussLearner:
                     delta_mu = self._delta_v(h_mb, old_h_seq[mb], eps_all[mb], mu_old)
                     mu_new = mu_old + delta_mu
                 else:
-                    mu_new = self.mac.agent.mean(h_mb, eps_all[mb])       # [M,N,A]
+                    if self.flow_cons_mode != "none" and self.flow_cons_coef > 0:
+                        mu_new, guesses = self.mac.agent.mean(h_mb, eps_all[mb], return_guesses=True)
+                    else:
+                        mu_new, guesses = self.mac.agent.mean(h_mb, eps_all[mb]), None
                 log_ratio = (
                     -0.5 * ((u - mu_new) / sigma_new) ** 2
                     + 0.5 * ((u - mu_old) / sigma_old) ** 2
@@ -248,6 +278,18 @@ class MAFPOGaussLearner:
 
                 entropy_total = self.mac.agent.entropy_per_agent().sum()
                 actor_loss = pg_loss
+                flow_cons, step_viol = None, None
+                if guesses is not None and len(guesses) > 1:
+                    if self.flow_cons_mode == "step":
+                        jumps = th.stack([(guesses[k + 1] - guesses[k]).abs()
+                                          for k in range(len(guesses) - 1)])        # [K-1,M,N,A]
+                        excess = th.relu(jumps - self.flow_cons_margin)
+                        flow_cons = excess.pow(2).mean()
+                        step_viol = (excess > 0).float().mean()
+                    else:  # "anchor"
+                        target = mu_new.detach()
+                        flow_cons = th.stack([(g - target).pow(2).mean() for g in guesses[:-1]]).mean()
+                    actor_loss = actor_loss + self.flow_cons_coef * flow_cons
                 if self.sigma_mode == "ppo" and entropy_coef > 0:
                     actor_loss = actor_loss - entropy_coef * entropy_total
 
@@ -265,6 +307,10 @@ class MAFPOGaussLearner:
                     actor_stats["approx_kl"].append((ratio - 1 - log_ratio).mean().item())
                     actor_stats["mu_shift_abs_mean"].append((mu_new - mu_old).abs().mean().item())
                     actor_stats["entropy_total"].append(entropy_total.item())
+                    if flow_cons is not None:
+                        actor_stats["flow_cons_loss"].append(flow_cons.item())
+                    if step_viol is not None:
+                        actor_stats["flow_step_viol"].append(step_viol.item())
 
         # ── ADER：theta 固定（用第一个 epoch、任何 actor 更新之前的 advantage
         # 快照）时 dJ/dlog sigma_{i,d} 的 score-function 估计，train() 末尾更新
@@ -442,9 +488,19 @@ class MAFPOGaussLearner:
         替代原来 T 步 Python 循环调 mac.forward——结果逐位一致，只是快。"""
         return self.mac.agent.encode_sequence(self.mac._build_inputs_all(batch))
 
-    def train_critic_sequential(self, critic, target_critic, batch, rewards, mask):
+    def train_critic_sequential(self, critic, target_critic, batch, rewards, mask, targets=None):
+        """targets=None：用 target_critic 现算 advantage / target_returns（原行为）；
+        否则直接用传进来的 (advantages, target_returns)（gae_value="online" 时每个
+        epoch 共用 train() 开头算好的那一份），只做 critic 的一步回归。"""
+        if targets is None:
+            advantages, target_returns = self._gae_targets(target_critic, batch, rewards, mask)
+        else:
+            advantages, target_returns = targets
+        return (advantages, target_returns) + (self._critic_step(critic, batch, target_returns, mask),)
+
+    def _gae_targets(self, value_net, batch, rewards, mask):
         with th.no_grad():
-            target_vals = target_critic(batch).squeeze(3)          # [B,T+1,N]
+            target_vals = value_net(batch).squeeze(3)              # [B,T+1,N]
         if self.args.standardise_returns:
             target_vals = target_vals * th.sqrt(self.ret_ms.var) + self.ret_ms.mean
         terminated = batch["terminated"][:, :-1].float()
@@ -454,7 +510,9 @@ class MAFPOGaussLearner:
         if self.args.standardise_returns:
             self.ret_ms.update(target_returns)
             target_returns = (target_returns - self.ret_ms.mean) / th.sqrt(self.ret_ms.var)
+        return advantages, target_returns
 
+    def _critic_step(self, critic, batch, target_returns, mask):
         running_log = {k: [] for k in ["critic_loss", "critic_grad_norm", "td_error_abs", "target_mean", "value_mean"]}
         v = critic(batch)[:, :-1].squeeze(3)
         td_error = target_returns.detach() - v
@@ -470,7 +528,7 @@ class MAFPOGaussLearner:
         running_log["td_error_abs"].append(masked_td_error.abs().sum().item() / mask_elems)
         running_log["value_mean"].append((v * mask).sum().item() / mask_elems)
         running_log["target_mean"].append((target_returns * mask).sum().item() / mask_elems)
-        return advantages, target_returns, running_log
+        return running_log
 
     def compute_gae(self, rewards, mask, values, terminated, gamma, gae_lambda):
         T = rewards.size(1)

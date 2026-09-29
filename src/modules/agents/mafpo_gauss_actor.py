@@ -70,6 +70,10 @@ class MAFPOGaussActor(nn.Module):
         #       which is what made the velocity parameterisation waste its first
         #       ~1M steps contracting the base noise.
         self.flow_param = str(getattr(args, "flow_param", "velocity")).lower()
+        # flow_head_act：flow 头 token 层 z = act(W1 [h, x_k, t]) 的激活。"relu"（默认，原行为）；
+        # "silu"：负区仍有梯度，token 单元不会像 ReLU 那样整片死掉回不来（lever 上
+        # seed8 最后一轮 ReLU 只剩 1% 存活，flow 被永久关掉）。
+        self.head_act = {"relu": F.relu, "silu": F.silu}[str(getattr(args, "flow_head_act", "relu")).lower()]
         assert self.flow_param in ("velocity", "endpoint"), self.flow_param
         self.flow_attention = False
         if self.mu_source == "flow":
@@ -115,6 +119,10 @@ class MAFPOGaussActor(nn.Module):
                 self.attn_norm = self._make_attn_norm(hidden_dim)
                 self.attn_qk_norm = self._make_qk_norm(hidden_dim // heads)
                 self.attn_gate = self._make_attn_gate(hidden_dim)
+                # flow_attention_kv："full"（默认）消息 = 队友的完整 token (h, x_k, t)；
+                # "h_only" 消融 = 消息里去掉 x_k（不交换 eps / 意图，只交换观测特征）。
+                self.attn_kv = str(getattr(args, "flow_attention_kv", "full")).lower()
+                assert self.attn_kv in ("full", "h_only"), self.attn_kv
         else:
             self.mu_fc1 = nn.Linear(hidden_dim, hidden_dim)
             self.mu_fc2 = nn.Linear(hidden_dim, n_actions)
@@ -152,9 +160,14 @@ class MAFPOGaussActor(nn.Module):
         assert self.sigma_param in ("sigmoid", "exp"), self.sigma_param
         self.sigma_min = float(getattr(args, "sigma_min", 0.01))
         self.sigma_max = float(getattr(args, "sigma_max", 1.0))
+        # sigma_floor（只对 exp 生效）：sigma = sigma_floor + exp(raw)，下界以上跟教科书
+        # 参数化一样平滑；0（默认）时与原来逐位一致。用来挡住 sigma 塌缩 ->
+        # KL ~ dmu^2/sigma^2 被放大的崩法（Swimmer / MAPPO Ant s42 那种）。
+        self.sigma_floor = float(getattr(args, "sigma_floor", 0.0))
         sigma_init = float(getattr(args, "sigma_init", 0.3))
         if self.sigma_param == "exp":
-            raw_init = math.log(sigma_init)
+            assert sigma_init > self.sigma_floor, (sigma_init, self.sigma_floor)
+            raw_init = math.log(sigma_init - self.sigma_floor)
         else:
             p_init = (sigma_init - self.sigma_min) / (self.sigma_max - self.sigma_min)
             p_init = min(max(p_init, 1e-4), 1 - 1e-4)
@@ -256,7 +269,7 @@ class MAFPOGaussActor(nn.Module):
     def sigma(self):
         """[n_agents, n_actions]（标量模式下由 [n_agents, 1] 广播而来）。"""
         if self.sigma_param == "exp":
-            s = th.exp(self.raw_sigma)                     # unbounded, textbook
+            s = self.sigma_floor + th.exp(self.raw_sigma)  # textbook when sigma_floor=0
         else:
             s = self.sigma_min + (self.sigma_max - self.sigma_min) * th.sigmoid(self.raw_sigma)
         return s.expand(-1, self.args.n_actions)
@@ -269,6 +282,8 @@ class MAFPOGaussActor(nn.Module):
         if log_sigma.shape != self.raw_sigma.shape:
             log_sigma = log_sigma.mean(dim=-1, keepdim=True)
         if self.sigma_param == "exp":
+            if self.sigma_floor > 0:
+                log_sigma = th.log(th.clamp(th.exp(log_sigma) - self.sigma_floor, min=1e-8))
             self.raw_sigma.copy_(log_sigma)
             return
         s = th.clamp(th.exp(log_sigma), self.sigma_min + 1e-6, self.sigma_max - 1e-6)
@@ -321,14 +336,23 @@ class MAFPOGaussActor(nn.Module):
         With flow_attention the agent axis must be the second-to-last one
         ([..., N, *]) because one round of inter-agent attention runs here."""
         inp = th.cat([h, x_t, self.embed_t(t)], dim=-1)
-        z = F.relu(self.vel_fc1(inp))                              # [..., N, H]
+        z = self.head_act(self.vel_fc1(inp))                       # [..., N, H]
         if self.flow_attention:
             lead, N, H = z.shape[:-2], z.shape[-2], z.shape[-1]
             assert N == self.args.n_agents, (
                 f"flow_attention needs the agent axis at dim -2, got {z.shape}")
             zf = z.reshape(-1, N, H)
             za = self.attn_norm(zf)
-            zf = self._gated_residual(zf, self._attend(self.attn, za, self.attn_qk_norm), self.attn_gate)
+            if self.attn_kv == "h_only":
+                # 消融：消息（K/V）里不带 x_k —— 看不到队友的 eps / 当前意图，只看得到
+                # 队友的观测特征 h；Q 仍是自己的完整 token。用同一个 W1，x 位置填 0。
+                inp_kv = th.cat([h, th.zeros_like(x_t), self.embed_t(t)], dim=-1)
+                zkv = self.attn_norm(self.head_act(self.vel_fc1(inp_kv)).reshape(-1, N, H))
+                assert self.attn_qk_norm is None, "flow_attention_kv=h_only 未实现 qk_norm 分支"
+                m = self.attn(za, zkv, zkv, need_weights=False)[0]
+            else:
+                m = self._attend(self.attn, za, self.attn_qk_norm)
+            zf = self._gated_residual(zf, m, self.attn_gate)
             z = zf.reshape(*lead, N, H)
         raw = self.vel_fc2(z)
         bound = float(getattr(self.args, "cfm_velocity_bound", 0.0))
@@ -345,23 +369,29 @@ class MAFPOGaussActor(nn.Module):
             return (out - x_t) / (1.0 - t).clamp(min=1e-6)
         return out
 
-    def integrate(self, h, eps, n_steps):
+    def integrate(self, h, eps, n_steps, return_guesses=False):
+        """return_guesses=True（只对 endpoint）另外返回每轮的终点猜测 [g_0 .. g_{K-1}]，
+        供 learner 的 flow_cons 正则用；不改变前向结果。"""
         x = eps
         dt = 1.0 / n_steps
+        guesses = [] if return_guesses else None
         for i in range(n_steps):
             t = x.new_full(x.shape[:-1] + (1,), i * dt)
             if self.flow_param == "endpoint":
                 # x + dt*(g - x)/(1 - t) with t = i/n_steps is exactly
                 # x + (g - x)/(n_steps - i); the integer form avoids the float
                 # division and makes the final step land exactly on g.
-                x = x + (self._head(h, x, t) - x) / (n_steps - i)
+                g = self._head(h, x, t)
+                if return_guesses:
+                    guesses.append(g)
+                x = x + (g - x) / (n_steps - i)
             else:
                 x = x + dt * self.velocity(h, x, t)
-        return x
+        return (x, guesses) if return_guesses else x
 
-    def mean(self, h, eps):
+    def mean(self, h, eps, return_guesses=False):
         """高斯均值：flow 端点（默认），或 MLP(h)（gauss_mu_source="mlp"，忽略
-        eps）。h/eps 的前导维任意。"""
+        eps）。h/eps 的前导维任意。return_guesses=True 时返回 (mu, [g_k] 或 None)。"""
         if self.mu_source == "mlp":
             z = F.relu(self.mu_fc1(h))
             if getattr(self, "mu_attention", False):
@@ -372,6 +402,10 @@ class MAFPOGaussActor(nn.Module):
                 za = self.mu_attn_norm(zf)
                 zf = self._gated_residual(zf, self._attend(self.mu_attn, za, self.mu_attn_qk_norm), self.mu_attn_gate)
                 z = zf.reshape(*lead, N, H)
-            return self.mu_fc2(z)
+            mu = self.mu_fc2(z)
+            return (mu, None) if return_guesses else mu
         n_steps = getattr(self.args, "cfm_rollout_steps", 10)
-        return self.integrate(h, eps, n_steps)
+        if return_guesses and self.flow_param == "endpoint":
+            return self.integrate(h, eps, n_steps, return_guesses=True)
+        mu = self.integrate(h, eps, n_steps)
+        return (mu, None) if return_guesses else mu
